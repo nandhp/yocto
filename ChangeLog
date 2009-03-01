@@ -1,0 +1,76 @@
+CURRENT
+	- Offer a tooltip when song information is too long to display
+	- Various cleanups and bugfixes
+0.51 (31 Jan 2009)
+	- Fix a bug which caused short songs to be skipped
+0.50 (28 Jan 2009)
+	- Replace the aging MPD.pm with a direct interface to the MPD server
+	- Support creating, loading, and modifying saved playlists
+	- Support setting of volume, crossfade, and audio outputs
+	- Support updating library and viewing statistics
+	- Improve error reporting
+	- Add support for GNOME multimedia keys (requires dbus-monitor)
+	- Optimize to avoid unnecessary round-trips and function calls
+	- New notification icon now works with transparent panels
+	- Fix seek control not working with Compiz.
+	- Fix Next Album to work with random/repeat
+	- Various bugfixes
+0.45 (24 Dec 2008)
+	- Remove the obsolete "Encoding" field from desktop file
+	- Fix seek slider visibility
+	- Minor documentation changes
+	- Finally add a playlist/library viewer/editor
+	- Fix all the allocation weirdnesses with the notification icon
+	- Add menu items to toggle random/repeat
+0.40 (12 Oct 2008)
+	- Really make Next Album work properly
+	- Switch to using a neat etched border
+	- Add seek slider. Bug: Isn't kept up-to-date during hover
+	- Implement a password prompt for authentication failed and
+	  permission denied.
+	- Implement a new plugin system (no user serviceable parts)
+	- Performed some cleanup made possible by the plugin system
+	- Improve the "Cannot connect" dialog box
+	- Add a Preferences dialog
+	- Add a settings to configure the command for and enable
+	  automatic MPD startup, replacing localhost detection
+	- Do not run the refill command when random or repeat are on
+	- Minor improvements
+0.31 (30 Mar 2008)
+	- Make Next Album work with the last album and a refill command
+	- Switch to debhelper for debian packaging
+	- Implement several command-line options
+	- Support installing to non-standard prefixes
+	- Write a manual page
+0.30 (05 Jan 2008)
+	- Program is now called yocto
+	- Add Next Album command
+	- Add tooltips to the buttons
+	- Minor performance improvements to help reduce system load
+	- Add support for specification of hosts, ports, and passwords
+	- Support MPD_HOST and MPD_PORT environment variables
+	- Various minor improvements
+0.25 (21 Jul 2007)
+	- Make mpd autostart work again after 0.24's zombie fix
+	- Properly decode the UTF-8(?) metadata provided by MPD
+0.24 (04 Jun 2007)
+	- Added end-user support for cover art (Settings/ShowCovers and
+	  External/MusicDirectory)
+	- Cover art thumbnail size now calculated from window height
+	- Don't leave zombies for Playlist viewer
+	- Corrupt covers should show up as "Missing Image" instead of
+          crashing program (Closes: #19270)
+	- Fixed erratic window movement during cover visibility changes
+0.23 (08 Apr 2007)
+	- Fixed cover directory handler (Closes: #16413)
+	- Added support for additional cover filenames (Closes: #16414)
+	- Minor other fixes
+0.22 (31 Mar 2007)
+	- Various improvements
+0.21 (25 Mar 2007)
+	- Improved connection and communications
+0.2  (24 Mar 2007)
+	- New popup window as implemented as window, with buttons, etc.
+	- New preferences supporting TrackNotify and RefillCommand
+0.1  (18 Mar 2007)
+	- Initial release

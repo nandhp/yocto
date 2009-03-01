@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Name=Yocto
+GenericName=MPD Client
+Comment=An MPD client for the system notification area
+Exec=yocto
+Icon=yocto
+StartupNotify=false
+Terminal=false
+Type=Application
+Categories=GTK;Application;AudioVideo;Audio;Music;Player;

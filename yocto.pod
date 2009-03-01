@@ -1,0 +1,133 @@
+#
+# Yocto - An MPD client for the system notification area.
+# Copyright (C) 2007-2009 nandhp <nandhp@gmail.com>
+#
+#    This program is free software; you can redistribute it and/or
+#    modify it under the terms of the GNU General Public License as
+#    published by the Free Software Foundation; either version 2 of
+#    the License, or (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with this program; if not, write to the Free Software
+#    Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
+#
+
+=head1 NAME
+
+yocto - An MPD client for the system notification area.
+
+=head1 SYNOPSIS
+
+B<yocto> [I<options>]
+
+=head1 DESCRIPTION
+
+B<Yocto> is an MPD client for the system notification area. Clicking
+on the icon toggles playback, right-clicking summons a menu, and
+hovering over the icon produces a popup window with track information
+and control buttons.
+
+=head1 OPTIONS
+
+=over 4
+
+=item B<--host>, B<-h> I<hostname>
+
+Override the hostname used to connect to the MPD server. See
+L</"SERVER CONNECTION">
+
+=item B<--port>, B<-p> I<port>
+
+Override the port number used to connect to the MPD server. See
+L</"SERVER CONNECTION">
+
+=item B<--password> I<password>
+
+Override the saved password used with the MPD server. See
+L</"SERVER CONNECTION">
+
+=item B<--help>
+
+Display a brief usage message.
+
+=item B<--version>
+
+Display version information.
+
+=back
+
+=cut
+
+=head1 SERVER CONNECTION
+
+B<Yocto> will try the following methods to collect server information.
+
+=over 4
+
+=item *
+
+The B<--host>, B<--port>, and B<--password> command-line options.
+
+=item *
+
+The B<MPD_HOST> and B<MPD_PORT> environment variables.
+
+=item *
+
+The B<Yocto> configuration file.
+
+=item *
+
+The default host B<localhost>, default port B<6600>.
+
+=back
+
+When using the B<MPD_HOST> environment variable, the password may be
+specified by setting B<MPD_HOST> to I<password>B<@>I<host>
+
+=head1 FILES
+
+=over 4
+
+=item F<~/.yocto>
+
+User configuration file. See L</"CONFIGURATION">.
+
+=back
+
+=head1 BUGS
+
+Probably.
+
+=head1 AUTHOR
+
+nandhp <nandhp@gmail.com>
+
+=head1 COPYRIGHT
+
+Copyright (C) 2007-2009 nandhp <nandhp@gmail.com>
+
+This program is free software; you can redistribute it and/or
+modify it under the terms of the GNU General Public License as
+published by the Free Software Foundation; either version 2 of
+the License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program; if not, write to the Free Software
+Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
+
+=head1 SEE ALSO
+
+L<mpc(1)>, L<mpd(1)>
+
+=cut

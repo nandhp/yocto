@@ -1,0 +1,1999 @@
+#!/usr/bin/perl
+#
+# Yocto - An MPD client for the system notification area.
+# Copyright (C) 2007-2009 nandhp <nandhp@gmail.com>
+#
+#    This program is free software; you can redistribute it and/or
+#    modify it under the terms of the GNU General Public License as
+#    published by the Free Software Foundation; either version 2 of
+#    the License, or (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with this program; if not, write to the Free Software
+#    Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
+#
+
+use Encode qw/encode decode/;
+use Gtk2;
+use Gtk2::TrayIcon;
+use File::Basename;
+use Config::IniFiles;
+use FindBin;
+use Getopt::Long;
+use IO::Socket::INET;
+use warnings;
+use strict;
+
+my $VERSION = 0.52;
+
+# Load "compilation" settings from footer (datadir). Also load text
+# strings from header comments (name, description, copyright, license)
+my $datadir = <DATA>;
+if ( $datadir && $datadir =~ m/^datadir=(.+?)\s+$/ ) { $datadir = $1 }
+else { $datadir = '.' }
+seek(DATA,0,0);				# Jump to the top of the file
+my ($progname,$tagline,$copyright,$license) = (undef,undef,undef);
+while (<DATA>) {
+    last if m/^[^#]/;
+    my ($text) = m/^#  +(.+)\s*$/;
+    if ( !$text && !defined($license) ) {
+	($progname,$tagline) = ($1,$2) if m/^# (.+?) - (.+)\s*$/;
+	$copyright = $1 if m/^# Copyright \([Cc]\) (.+)\s*$/;
+	next;
+    }
+    $license .= ($text||'')."\n";
+}
+$license =~ s/\s*$//;			# Remove trailing newlines
+
+# Parse the command line arguments
+my $argvhost;
+my $argvport;
+my $argvpass;
+my $trace = 0;
+GetOptions('host|h=s' => \$argvhost,
+	   'port|p=i' => \$argvport,
+	   'password=s' => \$argvpass,
+	   'trace+' => \$trace,
+	   'help|usage|?' => \&UsageMsg,
+	   'version' => \&VersionMsg) or UsageMsg();
+
+# Finish loading
+my %escapehtml = ('<'=>'&lt;', '>'=>'&gt;', '&'=>'&amp;', '"'=>'&quot;');
+my $escapehtml = join('',keys(%escapehtml));
+my $has_dbus = 0;
+$|=1;
+$SIG{CHLD} = 'IGNORE';
+Gtk2->init;
+
+# Set the window icons
+Gtk2::Window->set_default_icon_list
+  (Gtk2::Gdk::Pixbuf->new_from_file_at_size(findINC('yocto.svg'), 16, 16),
+   Gtk2::Gdk::Pixbuf->new_from_file_at_size(findINC('yocto.svg'), 32, 32),
+   Gtk2::Gdk::Pixbuf->new_from_file_at_size(findINC('yocto.svg'), 48, 48),
+   Gtk2::Gdk::Pixbuf->new_from_file_at_size(findINC('yocto.svg'), 64, 64),
+   Gtk2::Gdk::Pixbuf->new_from_file_at_size(findINC('yocto.svg'),128,128));
+
+# Load the configuration file
+my $configfile = "$ENV{HOME}/.yocto";
+my %config;
+tie %config, 'Config::IniFiles', ( -file => $configfile,
+				   -import => MakeDefaultConfig() );
+SaveConfig();
+
+# MPD state
+my %status = ();
+my %mpd = ();
+my %stats = ( db_update => 0 );
+my @playlist = ();
+my ($mpderror,$mpderrid) = (undef,0);
+my $sock;
+if ( (my $rc = MPDConnect(1)) <= 0 ) { exit } # Connect to MPD
+my %states = (play=>'Playing',pause=>'Paused',stop=>'Stopped');
+my $savedstate = '';
+my $savedsongid = -1;
+my $savedtransition = 0;
+my $savedplaylist = -1;
+my $dboldupdate = 0;
+my $dbwait = 1;
+my $ongoingtransition = 0;
+my $reconnectin = 0;
+my $misc = undef;
+my %misc = ();
+
+# Notification Icon
+my $iconsize = 0;
+my $iconpixbuf = undef;
+my $iconfn = '';
+my $oldiconfn = '';
+my ($msgvisible,$msghover,$msgtimeout) = (0,0,0);
+my ($icon,$eventbox);
+
+# Popup window
+my @tip = ('Line 1','Line 2','Line 3','Line 4','Line 5');
+my @oldtip = ('','','','','');
+my $oldcover = '';
+my $allowseek = 0;
+my ($wndhover,$transfers,$pbcb) = (0,0,1);
+my $tipobj = Gtk2::Tooltips->new;	# Tooltips widget
+my @labels = ();
+my $timemousein;
+my ($timeadjusting,$timeclicked) = (0,0);
+my ($window,$playbutton,$timescale,$timeswitcher,$timebox,$coverview);
+
+# Preferences
+my $prefsdlg;
+my @prefs_stats = ();
+my @prefs_stats_l = ();
+my $outputs_populated = 0;
+
+# Music Chooser
+my ($mcwnd,$mcsel,$mcselmodel,$mctree,$mctreemodel,$mcview,$mcsearch,$mcquery);
+my ($mcbutbox);
+my $mcvisible = 0;
+my ($mctype,$mcarg) = ('','');
+my $mcreorder = 0;
+my $mcscrollnext = 1;
+
+# Initialize widgets
+InitIcon();
+InitWindow();
+
+# Load plugins
+our @plugins = ();
+my $plugindir = findINC('yocto-plugins');
+if ( $plugindir and -d $plugindir ) {
+    opendir(DIR,$plugindir);
+    foreach ( readdir(DIR) ) {
+	next if $_ =~ m/^\.|~$/;
+	my $f = "$plugindir/$_";
+	next unless -f $f;
+	next if $f =~ m/[\$#]$/;
+	do $f or warn "Can't load plugin $f\n  Error(A): $@\n  Error(B): $!\n";
+    }
+}
+
+# Show everything
+$icon->show_all;
+Update();
+Glib::Timeout->add(1000, sub { Update(); 1 });
+#Glib::Timeout->add(1000*60, sub { Gtk2->main_quit }); # For Profiling
+
+# Set up DBus -- Would use Net::DBus, but it doesn't work with GTK,
+# and Net::DBus::Glib, isn't packaged yet. This is possibly more
+# portable anyway.
+my $dbus_command = findINC('dbus-monitor');
+$has_dbus=1 if $dbus_command;
+my $dbus_pid = -1;
+$dbus_pid = open(my $dbus, '-|', $dbus_command,
+		 'interface=org.gnome.SettingsDaemon.MediaKeys,'.
+		 'path=/org/gnome/SettingsDaemon/MediaKeys,'.
+		 'member=MediaPlayerKeyPressed') or ($has_dbus=0) if $has_dbus;
+my $dbus_readbuf = '';
+Glib::IO->add_watch(fileno $dbus, 'in', \&DBusMonitor) if $has_dbus;
+
+# Enter the main loop
+Gtk2->main;
+
+# Cleanup
+if ( $has_dbus ) {
+    # Have to kill dbus-monitor or Yocto hangs on exit.
+    kill 15, $dbus_pid if $dbus_pid > 1;
+    close $dbus;
+}
+SaveConfig();				# Save configuration
+
+# No execution below this line.
+
+# Utility and general functions
+
+sub escapeHTML { local $_ = shift; s/([$escapehtml])/$escapehtml{$1}/eg; $_ }
+
+sub findINC { # Locate a file by searching in some popular locations
+    my $file = shift;
+    if ($file =~ m(^/)) {
+	return $file if (-e $file);
+	return undef;
+    }
+    foreach my $dir ($datadir,$FindBin::Bin,@INC,split(':', $ENV{PATH}),'.','/usr/local/share','/usr/share','/usr/share/pixmaps','/usr/local/share/pixmaps','/usr/share/yocto','/usr/local/share/yocto')
+    {
+	my $f = "$dir/$file";
+	return $f if -e $f;
+    }
+    return undef;
+}
+
+sub FormatSong {
+    my %song = @_;
+    my @tip = ();
+
+    my $track   = $song{Track};
+    my $total   = $song{Track} && $song{Track} =~ m|(\d+)/(\d+)| ?
+      ($track=$1,$2) : 0;
+    my $file	= $song{file}||'';
+    my $title	= $song{Title}||'';
+    my $name	= $song{Name}||'';
+    my $artist	= $song{Artist}||'';
+    my $album	= $song{Album}||'';
+
+    my $fstrip = $file =~ m/^\w+:\/\// ? $file : basename($file);
+    $tip[0] = $title||$name||$fstrip||'(No Title)';
+    if ( $name ) {			# Streaming
+	if ( $title ) {			# With Track info
+	    $tip[1] = $name;
+	    $tip[2] = $file;
+	}
+	else {				# Without track info
+	    $tip[1] = $file;
+	    $tip[2] = ' ';
+	}
+    }
+    else {
+	my $trackinfo = '';
+	$album ||= '(No Album)';
+	if ( $track && $total )
+	  { $tip[1] = sprintf('%s (#%d of %d)', $album, $track,$total) }
+	elsif ( $track ) { $tip[1] = sprintf('%s (#%d)', $album, $track) }
+	else { $tip[1] = $album }
+	$tip[2] = $artist||'(No Artist)';
+    }
+    $_ = escapeHTML($_) foreach @tip;
+    return @tip;
+}
+
+sub FormatTime {
+    my ($sec) = @_;
+    my $hour = int($sec/3600);
+    my $min = int($sec/60)%60;
+    $sec = $sec%60;
+    my $shour = sprintf('%d:',$hour);
+    my $smin = sprintf($hour?'%02d':'%d',$min);
+    sprintf('%s%s:%02d',$hour?$shour:'',$smin,$sec);
+}
+
+sub Update {
+    MPDAuth(); # Check for authentication error, possibly requesting password
+    if ( !$sock or !MPDStatus() ) {
+	MPDReconnect();
+	HideTooltip();
+	return;
+    }
+
+    # Show the state icon
+    $iconfn = ($status{state} eq 'play') ? 'yocto.svg' : 'yocto-off.svg';
+    if ( $oldiconfn ne $iconfn ) { IconExpose() }
+
+    # Update the playlist
+    if ( $savedplaylist ne $status{playlist} ) {
+	my @changes = MPDPlaylistChanges($savedplaylist);
+	foreach ( @changes ) {
+	    $playlist[$_->{Pos}] = $_;
+	}
+	pop @playlist while @playlist > $status{playlistlength};
+    }
+
+    # Show the track info
+    $pbcb = -1;
+    $playbutton->set_active($status{state} eq 'play');
+    MakeTooltip();
+    $pbcb = 1;
+
+    # Show or hide the popup window
+    my $transition = DuringTransition();
+    HideTooltip() if !$transition and $transition != $savedtransition;
+    ShowTooltip(1) if $transition;
+    ShowTooltip(0);
+
+    # Refill the playlist
+    my $refill = $config{External}{RefillCommand};
+    if ( $refill and !$status{repeat} and !$status{random} and
+	 ($status{song}||-1)+1 == $status{playlistlength} ) {
+	system $refill;
+    }
+
+    &$_($status{state}) foreach @plugins;
+
+    if ( $savedsongid ne (defined($status{songid})?$status{songid}:-1)
+	 or $savedstate ne $status{state}||''
+	 or $savedplaylist ne $status{playlist} ) {
+	InvalidatePrefs();
+	if ( $mctype eq 'np' ) { $mcscrollnext = 0; MC_Repopulate() }
+    }
+
+    # Update stats
+    if ( $dboldupdate eq $stats{db_update} and $dbwait > 0 ) {
+	MPDStats();
+	$prefs_stats_l[0] = sprintf("    Artists: %d",$stats{artists});
+	$prefs_stats_l[1] = sprintf("    Albums: %d",$stats{albums});
+	$prefs_stats_l[2] = sprintf("    Songs: %d",$stats{songs});
+	$prefs_stats_l[3] = sprintf("Last refresh: %s",
+				    scalar localtime($stats{db_update}));
+	if ( @prefs_stats )
+	  { $prefs_stats[$_]->set_text($prefs_stats_l[$_]) foreach 0..3 }
+	$dbwait--;
+    }
+
+    # Save the state to detect changes
+    $savedstate = $status{state}||'';
+    $savedsongid = defined($status{songid})?$status{songid}:-1;
+    $savedtransition = $transition;
+    $savedplaylist = $status{playlist};
+}
+
+sub MakeTooltip {
+    my $state = $states{$status{state}};
+    my %song  = ();
+    %song = %{$playlist[$status{song}]}
+      if defined($status{song}) and $playlist[$status{song}];
+    my @timeinfo = ();
+
+    if ( !$song{file} || $status{state} eq 'stop' )
+      { @tip = ('Not Playing','','','','Playlist') }
+    else {
+	if ( $status{playlist} ne $savedplaylist or
+	     $status{songid} ne $savedsongid or
+	     $status{state} ne $savedstate ) {
+	    @tip = FormatSong(%song);
+	    $tip[4] = sprintf('%d of %d',
+			      $status{song}+1, $status{playlistlength});
+	}
+	@timeinfo = split(':',($status{time}||''));
+       	$tip[3] = $timeinfo[1]
+	  ? sprintf('%s/%s', FormatTime($timeinfo[0]),FormatTime($timeinfo[1]))
+	    : FormatTime($timeinfo[0]);
+    }
+
+    UpdateLabels();
+
+    # Cover art
+    if ( $savedsongid ne (defined($status{songid})?$status{songid}:-1)
+	 or $savedstate ne $status{state} ) {
+	my $cover = '';
+	if ( !$config{External}{MusicDirectory}
+	     || !$config{Settings}{ShowCovers} ) { # Covers off or unavailable
+	    SetCover('');
+	}
+	elsif ( $song{Name} or ($song{file}||'') =~ m/^\w+:\/\// ) {
+	    SetCover('');      # Streams have no covers, unfortunately
+	}
+	elsif ( !$song{file} || $status{state} eq 'stop' ) { SetCover('') }
+	else {
+	    my $d = $config{External}{MusicDirectory}.'/'.dirname($song{file});
+	    opendir DIR, $d;
+	    my @f = sort grep { PickCover($d,$_) } readdir DIR;
+	    closedir DIR;
+	    if ( @f == 1 || @f ) { SetCover("$d/$f[0]") } # Ambiguous too
+	    elsif ( @f == 0 ) { SetCover('') }
+	}
+    }
+
+    # Time scale
+    if ( $timescale ) {
+	$timeadjusting = 1;
+	if ( $savedsongid ne (defined($status{songid})?$status{songid}:-1)
+	     or $savedstate ne $status{state} ) {
+	    $allowseek =		# No seek if no length information
+	      ( @timeinfo == 2 && $timeinfo[1] && defined($timeinfo[0])
+		&& $timeinfo[1] >= $timeinfo[0] ) ? 1 : 0;
+	    SetTimebox($timebox) if !$allowseek;
+	    $timescale->set_range(0,$timeinfo[1]||1);
+	}
+	$timescale->set_value($timeinfo[0]||0) unless $timeclicked;
+	$timeadjusting = 0;
+    }
+}
+
+sub SetCover {
+    my ($cover) = @_;
+    return if $oldcover eq $cover;
+    $oldcover = $cover;
+    foreach my $w ( $coverview ) {
+	my $cv = $w->get_child();
+	if ( $cover && -e $cover ) {
+	    my $coversize = $cv->allocation->height;
+	    my $pixbuf = eval { Gtk2::Gdk::Pixbuf
+		->new_from_file_at_size($cover, $coversize, $coversize) }
+	      || eval {
+		  my $pixbuf = $window->render_icon('gtk-missing-image',
+						    'dialog');
+		  $pixbuf->scale_simple($coversize,$coversize,'hyper') };
+	    $cv->set_from_pixbuf($pixbuf);
+	    $w->set_padding(0,0,0,5);
+	}
+	else { $cv->clear(); $w->set_padding(0,0,0,0) }
+    }
+}
+
+sub PickCover {
+    my ($d,$f) = @_;
+    return 0 unless -e "$d/$f";
+    return 0 unless $f =~ m/(cover|folder)\.(jpe?g?|pn[gm]|gif|svg|[xp][pb]m)/i;
+    return 1;
+}
+
+# Popup (tooltip) window
+
+sub InitWindow {
+    my $winbox = Gtk2::VBox->new(0,0);
+    my $textbox = Gtk2::VBox->new(0,0);
+    my $labelidx = @labels;
+    push @labels,
+      (InitLabel(),InitLabel(),InitLabel(),InitLabel(),Gtk2::Label->new());
+    foreach ( $labelidx..$labelidx+2 ) {
+	$textbox->pack_start($labels[$_],0,0,0);
+	# Only works with Compiz
+	#$labels[$_]->signal_connect('expose-event',\&EllipsizedLabelTooltip);
+    }
+    $winbox->pack_start($textbox,0,0,0);
+
+    # Buttons
+    my $butbox = Gtk2::HBox->new(0,3);
+
+    # Play button
+    $playbutton = Gtk2::ToggleButton->new(); AllowTransfers($playbutton);
+    ConfigureButtonFromStock($playbutton, 'gtk-media-play', 'menu');
+    $playbutton->signal_connect('toggled', \&PlayButton);
+    $butbox->pack_start($playbutton,0,0,0);
+
+    # Previous button
+    my $button = Gtk2::Button->new(); AllowTransfers($button);
+    ConfigureButtonFromStock($button, 'gtk-media-previous', 'menu');
+    $button->signal_connect('clicked', \&MenuPrev);
+    $butbox->pack_start($button,0,0,0);
+
+    # Next button
+    $button = Gtk2::Button->new(); AllowTransfers($button);
+    ConfigureButtonFromStock($button, 'gtk-media-next', 'menu');
+    $button->signal_connect('clicked', \&MenuNext);
+    $butbox->pack_start($button,0,0,0);
+
+    # Time display and/or HScale
+    $timebox = Gtk2::EventBox->new();
+    $labels[3]->set_alignment(0.5, 0.5); $labels[3]->set_justify('center');
+
+    $timeswitcher = Gtk2::HBox->new();
+
+    # Set up time HScale
+    $timescale = Gtk2::HScale->new(undef);
+    $timescale->signal_connect('format-value',sub { FormatTime($_[1]) });
+    $timescale->signal_connect('value-changed', sub { MPDSeek($status{song},int($timescale->get_value)) if !$timeadjusting; 0 });
+    $timescale->set_update_policy('delayed');
+    #$timescale->set_draw_value(0);
+    $timescale->set_value_pos('left');
+
+    # Set up time Label
+    $timebox->add($labels[3]);
+    $timeswitcher->add($timebox);
+
+    # Set up HScale event handlers (this is complicated, and buggy!)
+    $timebox->add_events('pointer-motion-mask');
+    $timebox->signal_connect('motion-notify-event', sub {
+				 WndEnter(@_);
+				 return unless $allowseek;
+				 $timemousein = 1;
+				 SetTimebox($timescale);
+			     });
+    $timescale->signal_connect('leave-notify-event', sub {
+				   $timemousein = 0;
+				   return if $timeclicked;
+				   WndLeave(@_);
+				   $timemousein=0;
+				   Glib::Timeout->add
+				       (10, sub { return if $timemousein;
+						  SetTimebox($timebox) });
+			       });
+    $timescale->signal_connect('enter-notify-event', sub {
+				   WndEnter(@_);
+				   $timemousein = 1;
+			       });
+    $timescale->signal_connect('button-press-event',sub { $timeclicked=1;0 });
+    $timescale->signal_connect('button-release-event',sub { $timeclicked=0;0 });
+    $butbox->pack_start($timeswitcher,1,1,0);
+
+    # Playlist button
+    $button = Gtk2::Button->new(); AllowTransfers($button);
+    my $bbox = Gtk2::HBox->new();
+    $bbox->pack_start(Gtk2::Image->new_from_stock('gtk-index','menu'),0,0,0);
+    $bbox->pack_start($labels[4],0,0,0);
+    $button->add($bbox);
+    $button->signal_connect('clicked', \&ShowPlaylist);
+    $tipobj->set_tip($button,'Playlist');
+    $butbox->pack_end($button,0,0,0);
+
+    $butbox->set_size_request(300,-1);
+    $winbox->pack_end($butbox,0,0,0);
+
+    # Cover viewer
+    my $coverbox = Gtk2::HBox->new(0,0);
+    $coverview = Gtk2::Alignment->new(0,0.5,1,1);
+    $coverview->add(my $coverimage = Gtk2::Image->new());
+    $coverbox->pack_start($coverview,0,0,0);
+    $coverbox->pack_start($winbox,1,1,0);
+
+    # Window
+    $window = Gtk2::Window->new('popup');
+    $window->add($coverbox);
+    $coverbox->show_all;
+    $window->set_border_width(5);
+    $window->set_app_paintable(1);
+    $window->signal_connect('expose-event',\&PopupExpose);
+    $coverimage->signal_connect('size-allocate',
+				sub { SetCover($oldcover);
+				      ShowTooltip(0); 1 });
+
+    $window->set_decorated(0);
+    $window->set_resizable(0);
+    $window->realize;
+    # Not sure if this is safe, it's not documented:
+    # eval { $window->set_type_hint('tooltip'); };
+    AllowTransfers($window);
+}
+
+sub InitLabel {
+    my $label = Gtk2::Label->new();
+    $label->set_alignment(0, 0);
+    $label->set_padding(0,0);
+    $label->set_ellipsize('end');
+    return $label;
+}
+
+sub ConfigureButtonFromStock {
+    my ($w,$stock,$size) = @_;
+    # Add a stock icon
+    $w->add(Gtk2::Image->new_from_stock($stock,$size));
+    # Set the tooltip to the label without the mnemonic
+    my $stockt = Gtk2::Stock->lookup($stock)->{label};
+    $stockt =~ s/\(_[a-zA-Z]\)|_(?!_)//;
+    $tipobj->set_tip($w,$stockt);
+}
+
+sub UpdateLabels {
+    my $wrapped = '<span weight="bold" size="large">'.$tip[0].'</span>';
+    foreach ( 0..$#labels ) {
+	my $idx = $_ % 5;
+	$labels[$_]->set_markup($idx == 0 ? $wrapped: $tip[$idx])
+	  if $tip[$idx] ne $oldtip[$idx];
+    }
+    @oldtip = @tip;
+}
+
+sub SetTimebox {
+    my ($w) = @_;
+    #return if $w->get_parent()||'' eq $timebox;
+    $timeswitcher->foreach(sub { $timeswitcher->remove($_[0]) });
+    $timeswitcher->add($w);
+    $timeswitcher->show_all;
+}
+
+sub EllipsizedLabelTooltip {
+    my ($win,$event,$l) = @_;
+    # Note: Requires Pango 1.16 (and appropriately recent bindings!)
+    eval { $tipobj->set_tip($l, $l->get_layout()->is_ellipsized() ?
+			    $l->get_text() : '') };
+    return 0;
+}
+
+sub PopupExpose {
+    my $win = $window->window;
+    my ($w,$h) = $window->get_size();
+    #my ($fgc) = $window->get_style()->fg_gc('normal');
+    #my ($bgc) = $window->get_style()->bg_gc('normal');
+    #$win->draw_rectangle($fgc, 1, 0, 0,$w  , $h  );
+    #$win->draw_rectangle($bgc, 1, 1, 1,$w-2, $h-2);
+
+    # Draw a fancy etched border
+    $window->get_style()->paint_box($win, 'normal', 'out', undef, $window,
+				    '', 0, 0, $w, $h);
+
+    # Required when not under Compiz, can't attach the label itself.
+    EllipsizedLabelTooltip(undef,undef,$_) foreach @labels;
+
+    return 0;
+}
+
+sub ShowTooltip {
+    my ($newone) = @_;
+    $msgtimeout = int($newone/1000) if $newone > 100;
+    $msgtimeout = 0 if $newone && $newone < 100;
+
+    return unless $newone || $msgvisible; # Do nothing if popup hidden!
+    return unless $icon->get('embedded'); # Don't show popup if icon missing!
+
+    # Compute position
+    my ($wndx,$wndy) = $eventbox->window->get_origin();
+    my ($iconw,$iconh) = $icon->get_size_request();
+    my ($wndw,$wndh) = $window->get_size();
+    my ($scrw,$scrh) = (Gtk2::Gdk->screen_width(), Gtk2::Gdk->screen_height());
+    if ( $wndx < $iconw ) { $wndx = $iconw }
+    if ( $wndy < $iconh ) { $wndy = $iconh }
+    if ( $wndx + $wndw > $scrw ) { $wndx = $scrw-$wndw-$iconw }
+    if ( $wndy + $wndh > $scrh ) { $wndy = $scrh-$wndh-$iconh }
+
+    my $oldallowseek = $allowseek;
+    $allowseek = 0;
+    $window->move($wndx,$wndy);
+    $window->show;
+    $allowseek = $oldallowseek;
+    $msgvisible = 1;
+}
+
+sub HideTooltip {
+    $msgtimeout = 0;
+    return if $msghover or $wndhover or DuringTransition();
+    $msgvisible = 0;
+    $window->hide;
+    # In case the leave event wasn't called, which appears to happen
+    # occasionally.
+    $timemousein = 0;
+    SetTimebox($timebox);
+}
+
+sub DuringTransition {
+    return $ongoingtransition = 0 if !$config{Settings}{TrackNotify} or !$sock;
+    return $ongoingtransition-- if $ongoingtransition;
+    return 0 if $status{state} ne 'play';
+    return $ongoingtransition = 3 if $savedstate ne $status{state};
+    my @timeinfo = split(':',$status{time});
+    if ( #( $timeinfo[1] and $timeinfo[1]-$timeinfo[0] <= 1 ) or
+	 $timeinfo[0] <= 3 ) {
+	return 1;
+    }
+}
+
+sub WndEnter {
+    $wndhover = 1;
+    return 0;
+}
+
+sub WndLeave {
+    $wndhover = 0;
+    MakeTransfer();
+    return 0;
+}
+
+sub MakeTransfer {
+    #$transfers++;
+    Glib::Timeout->add(400, \&DoTransfer);
+}
+
+sub DoTransfer {
+    $transfers--;
+    return if $transfers > 0;
+    HideTooltip();
+    return 0;
+}
+
+sub AllowTransfers {
+    $_[0]->signal_connect('enter-notify-event' => \&WndEnter);
+    $_[0]->signal_connect('leave-notify-event' => \&WndLeave);
+}
+
+# Notification Icon
+
+sub InitIcon {
+    $icon = Gtk2::TrayIcon->new('yocto');
+    $eventbox = Gtk2::EventBox->new(); # The EventBox for the notification icon
+    $icon->add($eventbox);
+    $eventbox->set_app_paintable(1);
+    $eventbox->signal_connect('expose-event', \&IconExpose);
+    $eventbox->signal_connect('size-allocate',\&IconAllocate);
+    $eventbox->signal_connect('button-press-event' => \&ButtonEvent);
+    $eventbox->signal_connect('enter-notify-event' => \&MouseEnter);
+    $eventbox->signal_connect('leave-notify-event' => \&MouseLeave);
+    $eventbox->signal_connect('scroll-event' => \&ButtonEvent);
+    $eventbox->set_visible_window(0);
+}
+
+sub IconExpose {
+    my ($size) = $icon->get_size_request();
+    my $win = $eventbox->window;
+    if ( !$iconpixbuf or ($iconsize ne $size) or ($oldiconfn ne $iconfn) ) {
+	$iconpixbuf = Gtk2::Gdk::Pixbuf->new_from_file_at_size
+	  (findINC($iconfn),$size,$size);
+    }
+    my ($fgc) = $icon->get_style()->fg_gc('normal');
+    return unless $fgc;
+
+    # Use clear() instead of draw_rect($bg_gc) because the latter
+    # doesn't work with a transparent panel. This behavior of
+    # Gtk2::Gdk::Window::clear() is not documented anywhere.
+    $win->clear();
+    $win->draw_pixbuf($fgc, $iconpixbuf, 0, 0, 0, 0, $size, $size, 'none',0,0);
+    $oldiconfn = $iconfn;
+
+    #my ($bgc) = $icon->get_style()->bg_gc('normal');
+    # Don't waste a get_size call on this. After all, the size request
+    # should be accurate, and if it's not it will be next time.
+    #my ($w,$h) = $win->get_size();
+    #print " $w $h $size\n";
+    #$w = $size if $size > $w;
+    #$h = $size if $size > $h;
+}
+
+sub IconAllocate {
+    my ($wx,$alloc) = @_;
+    my ($oldsize) = $icon->get_size_request();
+    my ($w,$h) = ($alloc->width,$alloc->height);
+    if ( $w != $h ) {
+	my $size = $w > $h ? $w : $h;
+	if ( $h == $oldsize ) { $size = $w }
+	if ( $w == $oldsize ) { $size = $h }
+	$icon->set_size_request($size,$size);
+    }
+}
+
+sub ButtonEvent {
+    my ($obj,$event) = @_;
+    if ( $event->type eq 'scroll' ) {
+	# Wheel up/down to adjust volume: highly unorthodox (but not uncommon)
+	if ( $sock && defined($status{volume}) ) {
+	    if ( $event->direction eq 'up' )
+	      { MPDVolume($status{volume}+1) }
+	    elsif ( $event->direction eq 'down' )
+	      { MPDVolume($status{volume}-1) }
+	    elsif ( $event->direction eq 'right' ) { MPDNext() }
+	    elsif ( $event->direction eq 'left' ) { MPDPrev() }
+	    Update();
+	}
+    }
+    elsif ( $event->button == 1 ) { $playbutton->clicked() } # Toggle playback
+
+    elsif ( $event->button == 3 ) {
+	MouseLeave();
+	my $menu = Gtk2::Menu->new(); my $item;
+
+	$item = Gtk2::ImageMenuItem->new('Next A_lbum');
+	$item->signal_connect('activate',\&NextAlbum);
+	$menu->append($item);
+
+	$menu->append(Gtk2::SeparatorMenuItem->new());
+
+	$item = Gtk2::CheckMenuItem->new('Ra_ndom');
+	$item->set_active($status{random});
+	$item->signal_connect('toggled',\&ToggleRandom);
+	$menu->append($item);
+
+	$item = Gtk2::CheckMenuItem->new('R_epeat');
+	$item->set_active($status{repeat});
+	$item->signal_connect('toggled',\&ToggleRepeat);
+	$menu->append($item);
+
+	$menu->append(Gtk2::SeparatorMenuItem->new());
+
+	$item = Gtk2::ImageMenuItem->new_from_stock('gtk-preferences');
+	$item->signal_connect('activate',\&Prefs);
+	$menu->append($item);
+
+	$item = Gtk2::ImageMenuItem->new_from_stock('gtk-help');
+	$item->signal_connect('activate',\&ShowHelp);
+	$menu->append($item);
+
+	$item = Gtk2::ImageMenuItem->new_from_stock('gtk-about');
+	$item->signal_connect('activate',\&AboutBox);
+	$menu->append($item);
+
+	$item = Gtk2::ImageMenuItem->new_from_stock('gtk-quit');
+	$item->signal_connect('activate',sub { Gtk2->main_quit });
+	$menu->append($item);
+
+	$menu->show_all;
+	$menu->popup(undef,undef,undef,undef,$event->button,$event->time);
+    }
+    return 1;
+}
+
+sub MouseEnter {
+    $msghover = 1;
+    ShowTooltip(1);
+    return 1;
+}
+
+sub MouseLeave {
+    $msghover = 0;
+    MakeTransfer();
+    return 1;
+}
+
+# Command handlers and callbacks
+
+sub NextAlbum {
+    my $refill = $config{External}{RefillCommand};
+    MPDStatus();
+    my $album = $playlist[$status{song}]{Album}||'';
+    while ( 1 ) {
+	MPDStatus();
+	my %song = MPDCurrentSong();
+	last if ($song{Album}||'') ne $album;
+	if ( $status{song}+1 == $status{playlistlength} ) {
+	    if ( $status{repeat} || $status{random} ) { MPDNext(); last }
+	    elsif ( $refill ) { system $refill }
+	    MPDStatus();
+	    last if $status{song}+1 == $status{playlistlength}; # Failed
+	}
+	MPDNext();
+    }
+}
+
+sub MenuPrev { MPDPrev(); Update() }
+sub MenuNext { MPDNext(); Update() }
+sub PlayButton {
+    my ($b) = @_;
+    if ( $pbcb == 0 ) {
+	$pbcb = -1;
+	$b->set_active(0);
+	$pbcb = 0;
+    }
+    if ( $pbcb != 1 ) { return }
+    elsif ( !$b->get_active() ) { # Make the state come into effect:
+	my %song = MPDCurrentSong();
+	if ( $song{Name} ) { MPDStop() }
+	else { MPDPause() }
+    }
+    else { MPDPlay() }
+    Update();
+}
+sub ToggleRandom { my ($w) = @_; MPDRandom($w->get_active()?1:0) }
+sub ToggleRepeat { my ($w) = @_; MPDRepeat($w->get_active()?1:0) }
+
+sub MediaKey {
+    my ($foo, $key) = @_;
+    if ( ($key eq 'Play') )
+      { $ongoingtransition = 3; $playbutton->clicked() }
+    elsif ( $key eq 'Stop' and $playbutton->get_active() )
+      { $ongoingtransition = 3; $playbutton->clicked() }
+    elsif ( $key eq 'Next' )
+      { $ongoingtransition = 3; MenuNext() }
+    elsif ( $key eq 'Previous' )
+      { $ongoingtransition = 3; MenuPrev() }
+}
+
+sub ShowPlaylist {
+    MC_Show();
+    $mcwnd->present();
+}
+
+sub ShowHelp {
+    if ( fork == 0 ) {			# Fork returns undef if it fails
+	my $bin = findINC('xterm') || findINC('gnome-terminal') ||
+	  findINC('x-terminal-emulator');
+	exec $bin, '-title', 'Yocto Help', '-e', 'sh', '-c',
+	      'man yocto||(echo Press ENTER...;head -1)';
+	warn 'Could not load xterm for help viewer';
+    }
+}
+
+sub AboutBox {
+    my $about = Gtk2::AboutDialog->new();
+    $about->set_name('Yocto');
+    $about->set_version(sprintf('%1.2f',$VERSION));
+    $about->set_comments($tagline);
+    $about->set_copyright("\251".$copyright);
+    $about->set_license($license);
+    $about->signal_connect('response', sub { $_[0]->destroy() });
+    $about->show();
+}
+
+sub UsageMsg { print STDERR "Usage: yocto [options]\n"; exit }
+sub VersionMsg {
+    printf STDERR <<END, $VERSION,$tagline,$copyright,$license;
+Yocto %1.2f - %s
+Copyright (C) %s
+
+%s
+
+END
+    exit(0);
+}
+
+sub DBusMonitor {
+    return 0 unless $has_dbus;
+    sysread($dbus, $dbus_readbuf, 1, length($dbus_readbuf));
+    while ( $dbus_readbuf =~ s/^.+signal[^\n]+member=MediaPlayerKeyPressed\s+[^\n]+\s+string "(\S+)"\s*//sg )
+      { MediaKey('',$1) }
+    return 1;
+}
+
+sub NoFunction {
+    my $dialog = Gtk2::MessageDialog->new_with_markup
+      ($icon, 'modal', 'error', 'ok',
+       '<span weight="bold" size="large">Error</span>'."\n\n".
+       'This function is not yet available.');
+    $dialog->set_title('Yocto');
+    $dialog->run;
+    $dialog->destroy;
+}
+
+# Configuration file
+
+sub MakeDefaultConfig {
+    my $config = Config::IniFiles->new();
+    $config->newval('Settings','TrackNotify',1);
+    $config->SetParameterComment('Settings','TrackNotify',
+				 '# Show notification when the track changes');
+
+    $config->newval('Settings','ShowCovers',1);
+    $config->SetParameterComment('Settings','ShowCovers',
+				 '# Show cover art (Requires MusicDirectory)');
+
+    $config->newval('External','MusicDirectory','');
+    $config->SetParameterComment('External','MusicDirectory',
+				 '# Set this to MPD\'s music_directory');
+
+    $config->newval('External','RefillCommand','');
+    $config->SetParameterComment('External','RefillCommand',
+				 '# Runs whenever the last track is selected');
+
+    $config->newval('External','MPDCommand','mpd');
+    $config->SetParameterComment('External','MPDCommand',
+				 '# Command to start MPD if AutoStart is on');
+
+    $config->newval('Connection','MPDHost','');
+    $config->SetParameterComment('Connection','MPDHost',
+				 '# The MPD host (Default is localhost)');
+
+    $config->newval('Connection','MPDPort','');
+    $config->SetParameterComment('Connection','MPDPort',
+				 '# The MPD port (Default is 6600)');
+
+    $config->newval('Connection','MPDPass','');
+    $config->SetParameterComment('Connection','MPDPass',
+				 '# Password for MPD (If necessary)');
+
+    $config->newval('Connection','AutoStart',0);
+    $config->SetParameterComment('Connection','AutoStart',
+				 '# Try starting MPD if connection fails');
+
+    return $config;
+}
+
+sub SaveConfig { tied(%config)->RewriteConfig() }
+
+# MPD Access functions
+sub MPDConnect {
+    %mpd = ();
+    $mpderror = undef;
+    $mpderrid = 0;
+    my $host = $argvhost || $ENV{MPD_HOST} || $config{Connection}{MPDHost} ||
+      'localhost';
+    my $port = $argvport || $ENV{MPD_PORT} || $config{Connection}{MPDPort} ||
+      6600;
+    my $pass = $argvpass || $config{Connection}{MPDPass} || '';
+    $pass = $1
+      if $host =~ s/^(.+)@// && !$argvpass && (!$pass || $ENV{MPD_HOST});
+
+    sub TryIt {
+	my ($host,$port,$pass) = @_;
+	$sock = IO::Socket::INET->new(PeerAddr => $host, PeerPort => $port);
+	if ( !$sock ) { ParseMPDError($!); return 0 }
+	$mpd{host} = $host;
+	$mpd{port} = $port;
+	MPDResponseSimple() or return 0;
+	if ( $pass ) {
+	    MPDSend('password', $pass);
+	    MPDResponseSimple();
+	    $mpd{password} = $pass;
+	}
+	return 1;
+    }
+    my $rc;
+    foreach my $i ( 0..3 ) {
+	last if $rc = TryIt($host,$port,$pass);
+	last unless $config{Connection}{AutoStart};
+	if ( $i == 0 ) {
+	    delete $SIG{CHLD};		# Needed to get exit codes
+	    my $rc = system($config{External}{MPDCommand}); # Start MPD
+	    $SIG{CHLD} = 'IGNORE';	# Put it back
+	    last if $rc != 0;
+	}
+	else { sleep $i }
+    }
+    $sock = undef unless $rc;
+    if ( $rc && !MPDUsable() ) { $sock = undef; $rc = 0 }
+    elsif ( !$rc && $_[0] ) {		# Interactive error
+	my $msg = sprintf("Cannot connect to MPD server %s:\n%s",
+			  "$host:$port",$mpderror||'No error reported.');
+	my $dialog = Gtk2::MessageDialog
+	  ->new_with_markup(undef, 'modal','error', 'none',
+			    '<span weight="bold" size="large">'.
+			    'Error'."</span>\n\n$msg");
+	$dialog->add_button('gtk-preferences', 'accept');
+	$dialog->add_button('gtk-quit','reject');
+	$dialog->set_default_response('reject');
+
+	$dialog->set_title('Yocto');
+	my $rc = $dialog->run;
+	$dialog->destroy;
+	Prefs() if $rc eq 'accept';
+    }
+    return $sock ? 1 : 0;
+}
+
+sub MPDReconnect {
+    return if $sock;
+    if ( $reconnectin <= 0 ) {
+	$tip[2] = 'Attempting to reconnect...'; UpdateLabels();
+	MPDConnect() or $reconnectin = 10;
+    }
+    else {
+	$tip[2] = "Reconnecting in $reconnectin seconds..."; UpdateLabels();
+	$reconnectin--;
+    }
+}
+
+sub MPDError {
+    # MPD has dropped the connection.
+    return unless $sock;
+    return MPDAuth() if $mpderror && ( $mpderrid == 3 || $mpderrid == 4 );
+    undef $sock;
+
+    # Reset the status
+    @tip = ('Disconnected from server',$mpderror,'','','Playlist');
+    UpdateLabels();
+    SetCover('');
+    $allowseek = 0;
+    SetTimebox($timebox);
+    $savedstate = 'error';
+    $savedsongid = -1;
+    $savedtransition = 0;
+    $savedplaylist = -1;
+    $pbcb = 0;
+    $playbutton->set_active(0);
+    %status = ();
+    %mpd = ();
+    %stats = ( db_update => 0 );
+    @playlist = ();
+    $dboldupdate = 0;
+    $dbwait = 1;
+
+    # Reset the icon
+    $iconfn = 'yocto-off.svg';
+    IconExpose();
+
+    # Blank the music chooser
+    MC_Repopulate();
+
+    # Refresh preferences
+    InvalidatePrefs();
+
+    # Reconnect
+    $reconnectin = 10;
+    return 0;
+}
+
+sub MPDUsable {
+    MPDSend('status');
+    %status = MPDResponseInfo();
+    MPDAuth() unless $status{state};
+    $mpderror = undef;		     # Clear any authentication errors
+    $mpderrid = 0;
+    return $status{state} ? 1 : 0;
+}
+
+sub MPDAuth {
+    return unless $sock && $mpderror && ( $mpderrid == 3 || $mpderrid == 4 );
+    # Authentication problem
+    $mpderror = undef;			# Clear the error
+    $mpderrid = 0;
+    my $hostspec = "$mpd{host}:$mpd{port}";
+    my $d = Gtk2::Dialog->new(sprintf('Enter password for %s',$hostspec),
+			      undef, 'modal', ());
+    $d->add_button('gtk-preferences', 'help') unless $icon;
+    $d->add_button($icon?'gtk-cancel':'gtk-quit','reject');
+    $d->add_button($icon?'gtk-ok':'gtk-connect', 'accept');
+    $d->set_default_response('accept');
+    $d->set_position('center');
+    $d->set_has_separator(0);
+    $d->set_resizable(0);
+
+    my $hbox = Gtk2::HBox->new();
+    $hbox->set_border_width(10);
+
+    my $a = Gtk2::Alignment->new(0.5,0,0,0);
+    $a->add(Gtk2::Image->new_from_stock('gtk-dialog-authentication','dialog'));
+    $hbox->pack_start($a,0,0,0);
+
+    my $vbox = Gtk2::VBox->new();
+
+    my $title = '<span weight="bold" size="large">' .
+      ($icon ? 'Access Denied' : 'Welcome to Yocto') . '</span>';
+    my $subtitle = sprintf("Please enter the MPD password for %s.", $hostspec);
+    my $l = Gtk2::Label->new("$title\n\n$subtitle\n");
+    $l->set_alignment(0,0.5);
+    $l->set_use_markup(1);
+    $vbox->pack_start($l,0,0,0);
+
+    my $passbox = Gtk2::HBox->new();
+    my $passlabel = Gtk2::Label->new('_Password:');
+    my $passentry = Gtk2::Entry->new();
+    $passlabel->set_use_underline(1);
+    $passlabel->set_mnemonic_widget($passentry);
+    $passentry->set_visibility(0);
+    $passentry->set_activates_default(1);
+    $passbox->pack_start($passlabel,0,0,0);
+    $passbox->pack_start($passentry,1,1,0);
+    $vbox->pack_start($passbox,0,0,0);
+
+    my $savecheck = Gtk2::CheckButton->new('_Remember this password');
+    $vbox->pack_start($savecheck,0,0,0);
+
+    $hbox->pack_start($vbox,1,1,0);
+    $d->vbox->add($hbox);
+    $d->show_all;
+    my $r = $d->run;
+    my $p = $passentry->get_text();
+    $d->destroy;
+
+    if ( $r eq 'accept' ) {
+	$argvpass = $p;
+	if ( $savecheck->get_active() )
+	  { $config{Connection}{MPDPass} = $argvpass; SaveConfig() }
+	return MPDConnect();
+    }
+    elsif ( $r eq 'help' ) { return Prefs() }
+}
+
+sub MPDPlay   { MPDSend('play',@_);   MPDResponseSimple(); MPDFuncRC() }
+sub MPDPause  { MPDSend('pause');     MPDResponseSimple(); MPDFuncRC() }
+sub MPDStop   { MPDSend('stop');      MPDResponseSimple(); MPDFuncRC() }
+sub MPDNext   { MPDSend('next');      MPDResponseSimple(); MPDFuncRC() }
+sub MPDPrev   { MPDSend('previous');  MPDResponseSimple(); MPDFuncRC() }
+sub MPDSeek   { MPDSend('seek',@_);   MPDResponseSimple(); MPDFuncRC() }
+sub MPDRandom { MPDSend('random',@_); MPDResponseSimple(); MPDFuncRC() }
+sub MPDRepeat { MPDSend('repeat',@_); MPDResponseSimple(); MPDFuncRC() }
+sub MPDClear  { MPDSend('clear');     MPDResponseSimple(); MPDFuncRC() }
+sub MPDAdd    { MPDSend('add',@_);    MPDResponseSimple(); MPDFuncRC() }
+sub MPDDelete { MPDSend('delete',@_); MPDResponseSimple(); MPDFuncRC() }
+sub MPDMove   { MPDSend('move',@_);   MPDResponseSimple(); MPDFuncRC() }
+sub MPDVolume { MPDSend('setvol',@_); MPDResponseSimple(); MPDFuncRC() }
+sub MPDXfade  { MPDSend('crossfade',@_); MPDResponseSimple(); MPDFuncRC() }
+
+sub MPDStatus { MPDSend('status'); %status = MPDResponseInfo(); MPDFuncRC() }
+sub MPDStats  { MPDSend('stats');  %stats  = MPDResponseInfo(); MPDFuncRC() }
+
+sub MPDUpdateDB { MPDSend('update'); MPDResponseSimple(); MPDFuncRC() }
+
+sub MPDCurrentSong {
+    MPDSend('currentsong');
+    my %song = MPDResponseInfo();
+    MPDFuncRC();
+    return %song;
+}
+
+sub MPDPlaylistChanges {
+    MPDSend('plchanges',@_);
+    my @changes = MPDResponseSongList();
+    MPDFuncRC();
+    return @changes;
+}
+
+sub MPDSearch {
+    MPDSend('search',@_);
+    my @results = MPDResponseSongList();
+    MPDFuncRC();
+    return @results;
+}
+
+sub MPDList {
+    MPDSend('lsinfo',@_);
+    my @list = MPDResponseRaw();
+    MPDFuncRC();
+    return @list;
+}
+
+sub MPDListPlaylist {
+    MPDSend('listplaylistinfo',@_);
+    my @results = MPDResponseSongList();
+    MPDFuncRC();
+    return @results;
+}
+
+sub MPDPlMove { MPDSend('playlistmove',@_); MPDResponseSimple(); MPDFuncRC() }
+sub MPDPlDelete
+  { MPDSend('playlistdelete',@_); MPDResponseSimple(); MPDFuncRC() }
+sub MPDPlClear{ MPDSend('playlistclear',@_); MPDResponseSimple(); MPDFuncRC() }
+sub MPDPlAdd  { MPDSend('playlistadd',@_);   MPDResponseSimple(); MPDFuncRC() }
+sub MPDPlRemove { MPDSend('rm',@_); MPDResponseSimple(); MPDFuncRC() }
+sub MPDPlSave { MPDSend('save',@_); MPDResponseSimple();
+		if ( $mpderror && $mpderrid == 56 ) { return 0 } # No-Overwrite
+		MPDFuncRC() }
+
+sub MPDOutputs {
+    MPDSend('outputs');
+    my @list = MPDResponseRaw();
+    MPDFuncRC();
+    return @list;
+}
+sub MPDEnableOutput
+  { MPDSend('enableoutput',@_); MPDResponseSimple(); MPDFuncRC() }
+sub MPDDisableOutput
+  { MPDSend('disableoutput',@_); MPDResponseSimple(); MPDFuncRC() }
+
+sub MPDSend {
+    unless ( $sock ) { ParseMPDError('Not connected'); return 0 }
+    my @l = ();
+    foreach ( @_ ) { my $x = (m/ / or $_ eq '')?('"'.$_.'"'):$_; push @l, $x }
+    my $msg = join(' ', @l);
+    print "> $msg " if $trace;
+    unless ( print $sock encode('utf-8',$msg),"\n" )
+      { ParseMPDError($!||'Write error'); return 0 }
+    return 1;
+}
+
+sub MPDReadResponseLine {
+    unless ( $sock ) { ParseMPDError('Not connected'); return undef }
+    my $x = <$sock>;
+    if ( !defined($x) ) { ParseMPDError($!||'Read error'); return $x }
+    $x =~ s/[\r\n]//g;
+    $x = decode('utf-8',$x);
+    if ( $trace )
+      { print '<'; print " $x\n" if $x =~ m/^OK|^ACK/ or $trace > 1 }
+    return $x;
+}
+
+sub MPDResponseSimple {
+    while ( 1 ) {
+	my $l = MPDReadResponseLine(); if ( !defined($l) ) { return 0 }
+	# Process response lines
+	if ( $l =~ m/^OK/ ) { $mpderror = undef; $mpderrid = 0; return 1 }
+	if ( $l =~ m/^ACK/ ) { ParseMPDError($l); return 0 }
+    }
+}
+
+sub MPDResponseInfo {
+    my %info = ();
+    my %decoy = ();
+    while ( 1 ) {
+	my $l = MPDReadResponseLine(); if ( !defined($l) ) { return %decoy }
+	if ( $l =~ m/^(.+?)\s*:\s*(.+)$/ ) { $info{$1} = $2 }
+	if ( $l =~ m/^OK/ ) { $mpderror = undef; $mpderrid = 0; return %info }
+	if ( $l =~ m/^ACK/ ) { ParseMPDError($l); return %decoy }
+    }
+}
+
+sub MPDResponseSongList {
+    my @list = ();
+    my @decoy = ();
+    my $info = {};
+    my $n = 0;
+    while ( 1 ) {
+	my $l = MPDReadResponseLine(); if ( !defined($l) ) { return @decoy }
+	if ( $l =~ m/^file\s*:/ ) { push @list, $info if $n++; $info = {} }
+	if ( $l =~ m/^(.+?)\s*:\s*(.+)$/ ) { $info->{$1} = $2 }
+	if ( $l =~ m/^OK/ ) { $mpderror = undef; $mpderrid = 0;
+			      push @list, $info if $n++; return @list }
+	if ( $l =~ m/^ACK/ ) { ParseMPDError($l); return @decoy }
+    }
+}
+
+sub MPDResponseRaw {
+    my @list = ();
+    my @decoy = ();
+    while ( 1 ) {
+	my $l = MPDReadResponseLine(); if ( !defined($l) ) { return @decoy }
+	push @list, $l;
+	if ( $l =~ m/^OK/ ) { $mpderror = undef; $mpderrid = 0; return @list }
+	if ( $l =~ m/^ACK/ ) { ParseMPDError($l); return @decoy }
+    }
+}
+
+sub ParseMPDError {
+    my ($l) = @_;
+    $l =~ m/^ACK \[(\d+)@\d+]\s*\{([^\}]+)\}\s*(.+)$/;
+    $mpderror = ($2 && $3) ? "$2: $3" : $l;
+    $mpderrid = $1||0;
+}
+
+sub MPDFuncRC { if ( $mpderror ) { MPDError(); return 0 } else { return 1 } }
+
+# Preferences
+
+sub Prefs {
+    return $prefsdlg->present if $prefsdlg;
+    my $dialog = $prefsdlg =
+      Gtk2::Dialog->new('Yocto Preferences',undef,'modal', ());
+    if ( $icon ) { $dialog->add_button('gtk-close', 'accept') }
+    else {
+	$dialog->add_button('gtk-quit','reject');
+	$dialog->add_button('gtk-connect', 'accept');
+    }
+    $dialog->set_default_response('accept');
+    $dialog->set_position('center');
+    $dialog->set_has_separator(0);
+    $dialog->set_resizable(0);
+
+    my $notebook = Gtk2::Notebook->new();
+
+    my $general = Gtk2::VBox->new();
+
+    my $tracknotify = Gtk2::CheckButton->new('Show _popup when track changes');
+    $tracknotify->set_active($config{Settings}{TrackNotify} ? 1 : 0);
+    $tracknotify->signal_connect('toggled',sub { $config{Settings}{TrackNotify} = $_[0]->get_active() ? 1 : 0 ; $savedstate = ''; 0 });
+    $general->pack_start($tracknotify,0,0,0);
+
+    my $showcovers = Gtk2::CheckButton->new("Display album _covers");
+    $showcovers->set_active($config{Settings}{TrackNotify} ? 1 : 0);
+    $showcovers->signal_connect('toggled',sub { $config{Settings}{ShowCovers} = $_[0]->get_active() ? 1 : 0 ; $savedstate = ''; 0 });
+    $general->pack_start($showcovers,0,0,0);
+    my $coversnote = Gtk2::Label->new('<small>Music Location is used to find cover images.</small>');
+    $coversnote->set_use_markup(1);
+    $coversnote->set_alignment(0,0);
+    $general->pack_start($coversnote,0,0,0);
+
+    my $server = Gtk2::VBox->new();
+    if ( $argvport or $ENV{MPD_PORT} or $argvhost or $ENV{MPD_HOST} ) {
+	my $alertbox = Gtk2::HBox->new();
+	my $alerticon = Gtk2::Image->new_from_stock('gtk-dialog-warning','dnd');
+	my $alert = Gtk2::Label->new("Some settings have been overridden\nand cannot be changed.");
+	$alertbox->pack_start($alerticon,0,0,0);
+	$alertbox->pack_start($alert,0,0,0);
+	$server->pack_start($alertbox,0,0,0);
+    }
+
+    my $serhbox = Gtk2::HBox->new();
+    my $serlvbox = Gtk2::VBox->new();
+    my $serevbox = Gtk2::VBox->new();
+    $serhbox->pack_start($serlvbox,0,0,0);
+    $serhbox->pack_start($serevbox,1,1,0);
+
+    my $hostentry = Gtk2::Entry->new();
+    $hostentry->set_text($config{Connection}{MPDHost});
+    my $hostlabel = Gtk2::Label->new('_Host: ');
+    ($hostlabel->set_sensitive(0),$hostentry->set_sensitive(0))
+      if $argvhost or $ENV{MPD_HOST};
+    $hostlabel->set_use_underline(1);
+    $hostlabel->set_mnemonic_widget($hostentry);
+    $hostlabel->set_alignment(0,0.5);
+    $serevbox->add($hostentry);
+    $serlvbox->add($hostlabel);
+
+    my $portentry = Gtk2::Entry->new();
+    $portentry->set_text($config{Connection}{MPDPort});
+    my $portlabel = Gtk2::Label->new('_Port: ');
+    ($portlabel->set_sensitive(0),$portentry->set_sensitive(0))
+      if $argvport or $ENV{MPD_PORT};
+    $portlabel->set_use_underline(1);
+    $portlabel->set_mnemonic_widget($portentry);
+    $portlabel->set_alignment(0,0.5);
+    $serevbox->add($portentry);
+    $serlvbox->add($portlabel);
+
+    $server->pack_start($serhbox,0,0,0);
+
+    my $sernotice = Gtk2::Label->new('<small>The default host is localhost, the default port is 6600.</small>');
+    $sernotice->set_alignment(0,0);
+    $sernotice->set_use_markup(1);
+    $sernotice->set_line_wrap(1);
+    $server->add($sernotice);
+
+    my $passlabel = Gtk2::Label->new('Saved Password: ');
+    $passlabel->set_alignment(0,0.5);
+    #$serlvbox->add($passlabel);
+    my $passhbox = Gtk2::HBox->new();
+    my $passbutton = Gtk2::Button->new_from_stock('gtk-clear');
+    $passbutton->set_sensitive($config{Connection}{MPDPass} ? 1 : 0);
+    $passbutton->signal_connect
+      ('clicked', sub { $config{Connection}{MPDPass} = '';
+			$mpd{password} = '' if exists($mpd{password});
+			SaveConfig(); $_[0]->set_sensitive(0); } );
+    #$serevbox->add(Gtk2::Button->new_from_stock('gtk-clear'));
+    $passhbox->pack_start($passlabel,1,1,0);
+    $passhbox->pack_start($passbutton,0,0,0);
+    $server->pack_start($passhbox,0,0,0);
+
+    my $autostart = Gtk2::CheckButton->new("Try _starting MPD if connection fails");
+    $autostart->set_active($config{Connection}{AutoStart} ? 1 : 0);
+    $autostart->signal_connect('toggled',sub { $config{Connection}{AutoStart} = $_[0]->get_active() ? 1 : 0 ; 0 });
+    $server->pack_start($autostart,0,0,0);
+
+    my $dirhbox = Gtk2::HBox->new();
+    my $direntry = Gtk2::Entry->new();
+    $direntry->set_text($config{External}{MusicDirectory}||$ENV{HOME});
+    #$direntry->set_alignment(0,0.5);
+
+    my $dirbutton = Gtk2::Button->new();
+    #my $dirbhbox = Gtk2::HBox->new();
+    #$dirbhbox->pack_start($direntry,1,1,0);
+    #$dirbhbox->pack_start(Gtk2::VSeparator->new(),0,0,0);
+    #$dirbhbox->pack_start(Gtk2::Image->new_from_stock('gtk-open','menu'),0,0,0);
+    $dirbutton->add(Gtk2::Image->new_from_stock('gtk-open','menu'));
+    $dirbutton->signal_connect
+      ('clicked',
+       sub {
+	   my $dirselect = Gtk2::FileChooserDialog->new('Select Music Location',$dialog,'select-folder',('gtk-cancel','reject','gtk-open','accept'));
+	   $dirselect->set_local_only(1);
+	   $dirselect->set_filename($direntry->get_text());
+	   my $r = $dirselect->run();
+	   $direntry->set_text($dirselect->get_filename()) if $r eq 'accept';
+	   $dirselect->destroy();
+       });
+    my $dirlabel = Gtk2::Label->new('Music _Location: ');
+    $dirlabel->set_use_underline(1);
+    $dirlabel->set_mnemonic_widget($direntry);
+    $dirlabel->set_alignment(0,0.5);
+    $dirhbox->pack_start($dirlabel,0,0,0);
+    $dirhbox->pack_start($direntry,1,1,0);
+    $dirhbox->pack_start($dirbutton,0,0,0);
+    $server->pack_start($dirhbox,0,0,0) if $icon;
+
+    my $audio = Gtk2::VBox->new();
+
+    my $volbox = Gtk2::HBox->new();
+    my $volscale = Gtk2::HScale->new();
+    $volscale->set_update_policy('delayed');
+    $volscale->set_value_pos('left');
+    $volscale->set_draw_value(1);
+    $volscale->set_range(0,100);
+    $volscale->set_value($status{volume}||0);
+    $volscale->signal_connect('format-value',sub { int($_[1])."%" });
+    $volscale->signal_connect('value-changed', sub { MPDVolume(int($volscale->get_value)); 0 });
+    $volbox->set_sensitive(0) if !defined($status{volume});
+    $volbox->signal_connect('expose-event', sub {
+				my $sens = $volbox->get_property('sensitive');
+				if ( !$sens && defined($status{volume}) ) {
+				    $volscale->set_value($status{volume});
+				    $volbox->set_sensitive(1);
+				}
+				elsif ( $sens && !defined($status{volume}) ) {
+				    $volscale->set_value(0);
+				    $volbox->set_sensitive(0);
+				}});
+
+    my $vollabel = Gtk2::Label->new('_Volume:');
+    $vollabel->set_use_underline(1);
+    $vollabel->set_mnemonic_widget($volscale);
+    $vollabel->set_alignment(0,0.5);
+    $volbox->pack_start($vollabel,0,0,0);
+    $volbox->pack_start($volscale,1,1,0);
+    $audio->pack_start($volbox,0,0,0);
+
+    my $xfadebox = Gtk2::HBox->new();
+    my $xfadeadj = Gtk2::Adjustment->new(0,0,30,1,5,0);
+    my $xfadescale = Gtk2::SpinButton->new($xfadeadj,0,0);
+    $xfadescale->set_update_policy('if-valid');
+    $xfadescale->set_numeric(1);
+    $xfadescale->set_value($status{xfade}||0);
+    $xfadescale->signal_connect('value-changed', sub { MPDXfade(int($xfadescale->get_value)); 0 });
+    $xfadebox->set_sensitive(0) if !defined($status{xfade});
+    $xfadebox->signal_connect('expose-event', sub {
+				my $sens = $xfadebox->get_property('sensitive');
+				if ( !$sens && defined($status{xfade}) ) {
+				    $xfadescale->set_value($status{xfade});
+				    $xfadebox->set_sensitive(1);
+				}
+				elsif ( $sens && !defined($status{xfade}) ) {
+				    $xfadescale->set_value(0);
+				    $xfadebox->set_sensitive(0);
+				}});
+
+    my $xfadelabel = Gtk2::Label->new('_Crossfade:');
+    $xfadelabel->set_use_underline(1);
+    $xfadelabel->set_mnemonic_widget($xfadescale);
+    $xfadelabel->set_alignment(0,0.5);
+    $xfadebox->pack_start($xfadelabel,0,0,0);
+    $xfadebox->pack_end(Gtk2::Label->new('seconds'),0,0,0);
+    $xfadebox->pack_end($xfadescale,0,0,0);
+    $audio->pack_start($xfadebox,0,0,0);
+
+    my $outputmodel = Gtk2::ListStore->new('Glib::Int', # outputid
+					   'Glib::Boolean', # outputenabled
+					   'Glib::String'); # outputname
+    my $outputs = Gtk2::TreeView->new($outputmodel);
+    $outputs->set_headers_visible(0);
+
+    my $outlabel = Gtk2::Label->new('Audio _outputs:');
+    $outlabel->set_use_underline(1);
+    $outlabel->set_mnemonic_widget($outputs);
+    $outlabel->set_alignment(0,0.5);
+    $audio->pack_start($outlabel,0,0,0);
+
+    my $crt = Gtk2::CellRendererToggle->new();
+    $crt->signal_connect('toggled',\&OutputToggled,[$outputmodel,$outputs]);
+    my $cola = Gtk2::TreeViewColumn->new_with_attributes
+      ('',$crt, active => 1);
+    $outputs->append_column($cola);
+    my $colb = Gtk2::TreeViewColumn->new_with_attributes
+      ('',Gtk2::CellRendererText->new(), text => 2);
+    $outputs->append_column($colb);
+    my $outputsw = Gtk2::ScrolledWindow->new();
+    $outputsw->add($outputs);
+    $outputsw->set_shadow_type('etched-in');
+    $outputsw->set_policy('never','automatic');
+    $outputsw->set_size_request(1,100);
+    $audio->pack_start($outputsw,1,1,0);
+    $outputs_populated = 0;
+    $outputs->signal_connect('expose-event',\&PopulateOutputs,
+			    [$outputmodel,$outlabel,$outputsw]);
+    $outlabel->set_sensitive(0);
+    $outputsw->set_sensitive(0);
+
+    sub PopulateOutputs {
+	my ($outputs,$event,$args) = @_;
+	my ($outputmodel,$outlabel,$outputsw) = @$args;
+	return 0 if $outputs_populated;
+	$outputmodel->clear();
+	$outlabel->set_sensitive(0);
+	$outputsw->set_sensitive(0);
+	my @outputs = MPDOutputs();
+	my %output = ();
+	foreach ( @outputs, 'outputid:' ) {
+	    if ( m/^outputid:/ && %output ) {
+		$outputmodel->insert_with_values(-1,0,$output{outputid},
+						 1,$output{outputenabled}?1:0,
+						 2,$output{outputname});
+		%output = ();
+	    }
+	    if ( m/^(\w+): (.+)$/ ) { $output{$1} = $2 }
+	}
+	$outlabel->set_sensitive(1);
+	$outputsw->set_sensitive(1);
+	$outputs_populated = 1;
+	return 0;
+    }
+    sub OutputToggled {
+	my ($crt,$path,$args) = @_;
+	my ($model,$outputs) = @$args;
+	my $iter = $model->get_iter(Gtk2::TreePath->new_from_string($path));
+	my $id = $model->get($iter,0);
+	my $active = $model->get($iter,1);
+	if ( $active ) { MPDDisableOutput($id) }
+	else { MPDEnableOutput($id) }
+	$outputs_populated = 0;
+    }
+
+    my $library = Gtk2::VBox->new();
+    my $statlabel = Gtk2::Label->new('Library statistics:');
+    $statlabel->set_alignment(0,0.5);
+    $library->pack_start($statlabel,0,0,0);
+
+    @prefs_stats = ();
+    foreach (0..3) {
+	my $l = Gtk2::Label->new($prefs_stats_l[$_]);
+	$l->set_alignment(0,0.5);
+	$library->pack_start($l,0,0,0);
+    }
+    my $updalign = Gtk2::Alignment->new(1,0.5,0,0);
+    my $updbut = Gtk2::Button->new_from_stock('gtk-refresh');
+    $updbut->signal_connect
+      ('clicked', sub { $dboldupdate = $stats{db_update}; $dbwait = 120; MPDUpdateDB() });
+    $updalign->add($updbut);
+    $library->pack_start($updalign,0,0,0);
+
+    my $advanced = Gtk2::VBox->new();
+
+    my $refillentry = Gtk2::Entry->new();
+    $refillentry->set_text($config{External}{RefillCommand});
+    my $refilllabel = Gtk2::Label->new('_Refill command: <small>(Run to add songs to the playlist)</small>');
+    $refilllabel->set_use_markup(1);
+    $refilllabel->set_alignment(0,0);
+    $refilllabel->set_use_underline(1);
+    $refilllabel->set_mnemonic_widget($refillentry);
+    $advanced->pack_start($refilllabel,0,0,0);
+    $advanced->pack_start($refillentry,0,0,0);
+
+    my $mpdcmdentry = Gtk2::Entry->new();
+    $mpdcmdentry->set_text($config{External}{MPDCommand});
+    my $mpdcmdlabel = Gtk2::Label->new('_MPD command: <small>(Run to start the MPD daemon)</small>');
+    $mpdcmdlabel->set_use_markup(1);
+    $mpdcmdlabel->set_alignment(0,0);
+    $mpdcmdlabel->set_use_underline(1);
+    $mpdcmdlabel->set_mnemonic_widget($mpdcmdentry);
+    $advanced->pack_start($mpdcmdlabel,0,0,0);
+    $advanced->pack_start($mpdcmdentry,0,0,0);
+
+    if ( $icon ) {
+	$general->set_border_width(10);
+	$notebook->append_page($general,Gtk2::Label->new('General'));
+
+	$server->set_border_width(10);
+	$notebook->append_page($server,Gtk2::Label->new('Server'));
+
+	# TODO - Finish implementing Audio and Library tabs
+	$audio->set_border_width(10);
+	$notebook->append_page($audio,Gtk2::Label->new('Audio'));
+
+	$library->set_border_width(10);
+	$notebook->append_page($library,Gtk2::Label->new('Library'));
+
+	$advanced->set_border_width(10);
+	$notebook->append_page($advanced,Gtk2::Label->new('Advanced'));
+
+	my $nbvbox = Gtk2::VBox->new();
+	$nbvbox->set_border_width(5);
+	$nbvbox->add($notebook);
+	$dialog->vbox->add($nbvbox);
+    }
+    else {
+	my $serbox = Gtk2::VBox->new();
+	my $serlabel = Gtk2::Label->new('<big><b>Welcome to Yocto</b></big>');
+	$serlabel->set_use_markup(1);
+	$serlabel->set_alignment(0,0);
+	$serbox->add($serlabel);
+	my $seralign = Gtk2::Alignment->new(0.5,0.5,1,1);
+	#$seralign->set_padding(0,0,12,0);
+	$seralign->add($server);
+	$serbox->add($seralign);
+	$serbox->set_border_width(10);
+	$dialog->vbox->pack_start($serbox,0,0,0);
+    }
+    $dialog->show_all;
+    my $r = $dialog->run;
+
+    $prefsdlg = undef;
+    @prefs_stats = ();
+
+    $config{External}{RefillCommand} = $refillentry->get_text();
+    $config{External}{MPDCommand} = $mpdcmdentry->get_text();
+    my $newhost = $hostentry->get_text();
+    my $newport = $portentry->get_text();
+    my $newdir = $direntry->get_text();#$dirselect->get_filename();
+    $dialog->destroy;
+    if ( $newdir ne $config{External}{MusicDirectory} ) {
+	$config{External}{MusicDirectory} = $newdir;
+	$savedstate = '';
+    }
+    if ( $newhost ne $config{Connection}{MPDHost} or
+	 $newport ne $config{Connection}{MPDPort} or
+	 ( !$icon and $r eq 'accept' ) ) {
+	$config{Connection}{MPDHost} = $newhost;
+	$config{Connection}{MPDPort} = $newport;
+	SaveConfig();			# Save preferences
+	if ( $icon ) {
+	    my $dialog = Gtk2::MessageDialog->new_with_markup(undef, 'modal', 'info',
+							      'close', '<span weight="bold" size="large">Settings Changed</span>'."\n\n".'Yocto must be restarted for some of your changes to take effect.');
+	    $dialog->run;
+	    $dialog->destroy;
+	}
+	else { MPDConnect(1) }
+    }
+    elsif ( $r eq 'accept' ) { SaveConfig() } # Save preferences
+    #if ( $r eq 'accept' ) { }
+}
+
+sub InvalidatePrefs {
+    return unless $prefsdlg;
+    $outputs_populated = 0;
+    my $rect = Gtk2::Gdk::Rectangle->new(0,0,$prefsdlg->window->get_size());
+    $prefsdlg->window->invalidate_rect($rect,1);
+}
+
+# Music Chooser
+
+sub MC_Show {
+    if ( !$mcwnd ) {
+	$mcwnd = Gtk2::Window->new('toplevel');
+	$mcwnd->set_default_size(600,400); # TODO - Persistant geometry!
+	my $vbox = Gtk2::VBox->new();
+	my $topbox = Gtk2::HBox->new();
+
+	$mcselmodel = Gtk2::ListStore->new('Glib::String',  # Identifier
+					   'Glib::String'); # Visible markup
+
+	$mcsel = Gtk2::ComboBox->new($mcselmodel);
+	my $mcselcr = Gtk2::CellRendererText->new();
+	$mcsel->set_size_request(222,-1);
+	$mcsel->pack_start($mcselcr,1);
+	$mcsel->set_attributes($mcselcr,text => 1);
+	$mcsel->signal_connect('changed',\&MC_Repopulate);
+	$mcsel->set_row_separator_func
+	  (sub { my ($model,$iter) = @_; return $model->get($iter,0) eq ':' });
+	$topbox->pack_start($mcsel,0,0,0);
+
+	$mcsearch = Gtk2::Entry->new();
+	$mcsearch->set_size_request(222,-1);
+	$mcsearch->set_activates_default(0);
+	$mcsearch->signal_connect('activate', sub { $mcquery = $mcsearch->get_text(); $mcsel->set_active(-1); $mcsel->set_active(1); });
+	$topbox->pack_end($mcsearch,0,0,0);
+	my $mcsearchlabel = Gtk2::Label->new('   _Search Library: ');
+	$mcsearchlabel->set_use_underline(1);
+	$mcsearchlabel->set_mnemonic_widget($mcsearch);
+	$topbox->pack_end($mcsearchlabel,0,0,0);
+
+	$vbox->pack_start($topbox,0,0,0);
+
+	$mctreemodel = Gtk2::ListStore->new('Glib::String', # Identifier
+					    'Glib::Boolean', # Current Song
+					    'Glib::String', # Visible markup
+					    'Glib::Int');   # Index
+	$mctreemodel->signal_connect('row-inserted',\&MC_Reordered);
+	$mctree = Gtk2::TreeView->new($mctreemodel);
+	$mctree->set_headers_visible(0);
+	eval { $mctree->set_grid_lines('horizontal') }; # Requires GTK 2.10
+	$mctree->get_selection()->set_mode('multiple');
+	$mctree->signal_connect('row-activated',\&MC_ActivateRow);
+	my $cra = Gtk2::CellRendererPixbuf->new();
+	my $cola = Gtk2::TreeViewColumn->new_with_attributes('',$cra);
+	$cola->set_cell_data_func
+	  ($cra, sub {
+	       my ($col, $cell, $model, $iter) = @_;
+	       $cell->set_property
+		 ('pixbuf', $model->get($iter,1) ?
+		  $mctree->render_icon('gtk-media-play','small-toolbar'):undef)
+	     });
+	$mctree->append_column($cola);
+	my $colb = Gtk2::TreeViewColumn->new_with_attributes
+	  ('',Gtk2::CellRendererText->new(), markup => 2);
+	$mctree->append_column($colb);
+	my $scroller = Gtk2::ScrolledWindow->new();
+	$scroller->add($mctree);
+	$scroller->set_shadow_type('etched-in');
+	$scroller->set_policy('never','automatic');
+	$scroller->set_size_request(1,100);
+	$vbox->pack_start($scroller,1,1,0);
+
+	$mcbutbox = Gtk2::HBox->new();
+	$vbox->pack_start($mcbutbox,0,0,0);
+
+	$mcwnd->add($vbox);
+	$mcwnd->signal_connect('delete-event',
+			       sub { $mcwnd->hide; $mcvisible = 0; 1 });
+    }
+    $mcvisible = 1;
+    MC_RepopulateSel();
+    $mcsel->set_active(-1);
+    $mcsel->set_active(0);
+    $mcwnd->show_all;
+}
+sub MC_Repopulate {			# Repopulate the main view
+    return $mcscrollnext = 1 unless $mcvisible;
+    $mcreorder = 1;
+    $mctreemodel->clear();
+    $mctree->set_reorderable(0);
+    return $mcscrollnext = 1 if $mcsel->get_active() < 0 or !$sock;
+    my $iter = $mcsel->get_active_iter();
+    my $path = $mcselmodel->get($iter,0);
+    my ($type,$arg) = ($mctype,$mcarg) = split ':', $path;
+    my @list = ();
+    my $scrollto = 0;
+    if ( $type eq 'np' ) {
+	@list = @playlist;
+	$scrollto = $status{song};
+	$mcwnd->set_title('Now Playing');
+	$mctree->set_reorderable(1);
+    }
+    elsif ( $type eq 'sr' ) {
+	@list = MPDSearch('any',$mcquery||'') if length($mcquery||'') >= 3;
+	no warnings;
+	@list = sort { ($a->{Album}||'') cmp ($b->{Album}||'')
+			 || ($a->{Track}||0) <=> ($b->{Track}||0) } @list
+			   if $list[0];
+	$mcwnd->set_title('Search Results');
+    }
+    elsif ( $type eq 'pl' ) {
+	@list = MPDListPlaylist($arg);
+	$mcwnd->set_title($arg);
+	$mctree->set_reorderable(1);
+    }
+    else { return }
+
+    my $i = 0;
+    foreach ( @list ) {
+	last unless $_;
+	my %song = %$_;
+	#$song{$_} = decode('utf-8',$song{$_}) foreach keys %song;
+	my @song = FormatSong(%song);
+	$song[0] = ($type eq 'np' or $type eq 'pl') ?
+	  ('<b>'.($i+1).". $song[0]</b>") :
+	    "<b>$song[0]</b>";
+	my $current = 0;
+	$current = ((defined($status{songid}) ? $status{songid} : -1)
+		    eq (exists($song{Id}) ? $song{Id} : -2)) ? 1 : 0
+		      if ($status{state}||'') eq 'play' or
+			($status{state}||'') eq 'pause';
+
+	$mctreemodel->insert_with_values(-1, 0, $_->{file}, 1, $current,
+					 2, join("\n", @song), 3, $i);
+	$i++;
+    }
+    if ( $mcscrollnext ) {
+	if ( $scrollto )
+	  { $mctree->scroll_to_cell(Gtk2::TreePath->new_from_string($scrollto),
+				    undef,1,0.5,0) }
+	else { $mctree->realize; $mctree->scroll_to_point(0,0) }
+    }
+    $mcscrollnext = 1;
+    # Buttons!
+    $mcbutbox->foreach(sub { $mcbutbox->remove($_[0]) });
+
+    my $tmpbut;
+    if ( $type eq 'np' ) {
+	$tmpbut = Gtk2::Button->new_from_stock('gtk-save');
+	$mcbutbox->pack_start($tmpbut,0,0,0);
+	$tmpbut->signal_connect('clicked', \&MC_Save);
+    }
+    if ( $type eq 'pl' ) {
+	$tmpbut = Gtk2::Button->new_from_stock('gtk-delete');
+	$mcbutbox->pack_start($tmpbut,0,0,0);
+	$tmpbut->signal_connect('clicked', \&MC_Delete);
+    }
+    if ( $type eq 'np') {		# or $type eq 'pl'
+	$tmpbut = Gtk2::Button->new_from_stock('gtk-clear');
+	$mcbutbox->pack_start($tmpbut,0,0,0);
+	$tmpbut->signal_connect('clicked', \&MC_Clear);
+    }
+    if ( $type eq 'sr' or $type eq 'pl' ) {
+	$tmpbut = Gtk2::Button->new();
+	my $tmpbox = Gtk2::HBox->new();
+	$tmpbox->pack_start(Gtk2::Image->new_from_stock('gtk-add','button'),0,0,0);
+	my $tmplabel = Gtk2::Label->new('Add a_ll');
+	$tmplabel->set_use_underline(1);
+	$tmpbox->pack_start($tmplabel,0,0,0);
+	$tmpbut->add($tmpbox);
+	$mcbutbox->pack_start($tmpbut,0,0,0);
+	$tmpbut->signal_connect('clicked',\&MC_AddAll);
+    }
+    if ( $type eq 'pl' ) {
+	$tmpbut = Gtk2::Button->new_from_stock('gtk-media-play');
+	$mcbutbox->pack_start($tmpbut,0,0,0);
+	$tmpbut->signal_connect
+	  ('clicked', sub { MPDClear(); MC_AddAll(); MPDPlay(0); Update();
+			    $mcsel->set_active(0) });
+    }
+    if ( $type eq 'sr' or $type eq 'pl' ) {
+	$tmpbut = Gtk2::Button->new_from_stock('gtk-add');
+	$mcbutbox->pack_end($tmpbut,0,0,0);
+	$tmpbut->set_flags('can-default');
+	$tmpbut->grab_default();
+	$tmpbut->signal_connect('clicked',\&MC_AddSel);
+    }
+    if ( $type eq 'np' ) {
+	$tmpbut = Gtk2::Button->new_from_stock('gtk-jump-to');
+	$mcbutbox->pack_end($tmpbut,0,0,0);
+	$tmpbut->set_flags('can-default');
+	$tmpbut->grab_default();
+	$tmpbut->signal_connect('clicked',\&MC_JumpTo);
+    }
+    if ( $type eq 'np' or $type eq 'pl' ) {
+	$tmpbut = Gtk2::Button->new_from_stock('gtk-remove');
+	$mcbutbox->pack_end($tmpbut,0,0,0);
+	$tmpbut->signal_connect('clicked',\&MC_RemSel);
+    }
+    $mcbutbox->show_all;
+    $mcreorder = 0;
+}
+
+sub MC_RepopulateSel {			# Repopulate the drop down
+    return unless $mcvisible;
+    $mcselmodel->clear();
+    $mcselmodel->insert_with_values(-1,0,'np:',1,'Now Playing');
+    $mcselmodel->insert_with_values(-1,0,'sr:',1,'Search Results');
+    $mcselmodel->insert_with_values(-1,0,':');
+    my @results = MPDList();
+    foreach ( @results ) {
+	next unless s/^playlist: //; # Why can't I use an m/ here??
+	$mcselmodel->insert_with_values(-1,0,'pl:'.$_,1,$_);
+    }
+}
+
+sub MC_AddAll {
+    my $iter = $mctreemodel->get_iter_first();
+    return unless $iter;
+    do { MPDAdd($mctreemodel->get($iter,0)) }
+      while ( $iter = $mctreemodel->iter_next($iter) );
+}
+
+sub MC_AddSel {
+    my $sel = $mctree->get_selection();
+    foreach my $pos (sort { $a->to_string() <=> $b->to_string() }
+		     $sel->get_selected_rows()) {
+	my $iter = $mctreemodel->get_iter($pos);
+	MPDAdd($mctreemodel->get($iter,0));
+    }
+}
+
+sub MC_JumpTo {
+    return unless $mctype eq 'np';
+    my $sel = $mctree->get_selection();
+    my $pos = ($sel->get_selected_rows())[0] or return;
+    MPDPlay($pos->to_string());
+}
+
+sub MC_RemSel {
+    return unless $mctype eq 'np' or $mctype eq 'pl';
+    my $sel = $mctree->get_selection();
+    # In ASCENDING order to keep indices valid
+    my @sel = map { $_->to_string() } $sel->get_selected_rows();
+    foreach my $pos (sort { $b <=> $a } @sel) {
+	if ( $mctype eq 'np' ) { MPDDelete($pos) }
+	elsif ( $mctype eq 'pl' ) { MPDPlDelete($mcarg,$pos); MC_Repopulate() }
+    }
+    # Consider faking the update
+}
+
+sub MC_ActivateRow {
+    my ($tree,$path,$col) = @_;
+    $mctree->get_selection()->select_path($path);
+    $mcwnd->activate_default();
+}
+
+sub MC_Reordered {
+    return unless $mctype eq 'np' or $mctype eq 'pl';
+    return if $mcreorder;
+    my ($model,$path) = @_;
+    my $iter = $model->get_iter($path);
+    Glib::Timeout->add(10,sub {
+			   my ($iter) = @_;
+			   my $dest = $mctreemodel->get_path($iter)->to_string();
+			   my $src = $mctreemodel->get($iter,3);
+			   if ( $mctype eq 'np' ) { MPDMove($src,$dest) }
+			   elsif ( $mctype eq 'pl' )
+			     { MPDPlMove($mcarg,$src,$dest); MC_Repopulate() }
+			   return 0;
+			   },$iter);
+}
+
+sub MC_Clear {
+    $mctreemodel->clear();    # Clear treeview for fast feedback
+    if ( $mctype eq 'np' ) { MPDClear() }
+    elsif ( $mctype eq 'pl' ) { MPDPlClear($mcarg); MC_Repopulate() }
+}
+
+sub MC_Delete {
+    return if $mctype ne 'pl';
+    my $dialog = Gtk2::MessageDialog
+      ->new_with_markup(undef, 'modal','warning', 'none',
+			'<span weight="bold" size="large">'.
+			sprintf('Are you sure you want to delete the playlist "%s"?',$mcarg)
+			."</span>\n\n".
+			'Deleted playlists cannot be recovered later.');
+    $dialog->add_button('gtk-cancel','reject');
+    $dialog->add_button('gtk-delete', 'accept');
+    $dialog->set_default_response('accept');
+    my $rc = $dialog->run;
+    $dialog->destroy;
+    if ( $rc eq 'accept' ) {
+	MPDPlRemove($mcarg);
+	MC_RepopulateSel();
+	$mcsel->set_active(0);
+    }
+}
+
+sub MC_Save {
+    return if $mctype ne 'np';
+    my $dialog = Gtk2::Dialog->new('Save Playlist',undef,'modal', ());
+    $dialog->add_button('gtk-cancel','reject');
+    $dialog->add_button('gtk-save', 'accept');
+    $dialog->set_default_response('accept');
+
+    my $hbox = Gtk2::HBox->new();
+    my $entry = Gtk2::Entry->new();
+    $entry->set_size_request(333,-1);
+    $entry->set_activates_default(1);
+    my $label = Gtk2::Label->new('_Name:');
+    $label->set_use_underline(1);
+    $label->set_mnemonic_widget($entry);
+    $hbox->pack_start($label,0,0,0);
+    $hbox->pack_start(Gtk2::Label->new(''),0,0,5);
+    $hbox->pack_end($entry,1,1,0);
+    $hbox->set_border_width(10);
+    $dialog->vbox->add($hbox);
+
+    $dialog->show_all;
+    my $v = '';
+    while ( 1 ) {
+	my $rc = $dialog->run;
+	last if $rc ne 'accept';
+	my $v = $entry->get_text();
+	next if !length($v) or $v =~ m/\//;
+	my $sr = MPDPlSave($v);
+	last if $sr;
+	my $confirm = Gtk2::MessageDialog
+	  ->new_with_markup($dialog, 'modal','error', 'none',
+			'<span weight="bold" size="large">'.
+			sprintf('There is already a playlist named "%s".',$v)
+			."</span>\n\n".
+			'A playlist with this name already exists.');
+	$confirm->add_button('gtk-ok','reject');
+	$confirm->run;
+	$confirm->destroy;
+    }
+    $dialog->destroy;
+    MC_RepopulateSel();
+    $mcsel->set_active(0);
+}
+
+1;
+__DATA__

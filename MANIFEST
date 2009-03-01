@@ -1,0 +1,11 @@
+build_package.sh
+ChangeLog
+COPYING
+debian
+Makefile
+MANIFEST
+yocto
+yocto.desktop
+yocto-off.svg
+yocto.pod
+yocto.svg
