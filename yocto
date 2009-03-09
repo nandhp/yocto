@@ -163,28 +163,51 @@ Update();
 Glib::Timeout->add(1000, sub { Update(); 1 });
 #Glib::Timeout->add(1000*60, sub { Gtk2->main_quit }); # For Profiling
 
-# Set up DBus -- Would use Net::DBus, but it doesn't work with GTK,
-# and Net::DBus::Glib, isn't packaged yet. This is possibly more
-# portable anyway.
-my $dbus_command = findINC('dbus-monitor');
-$has_dbus=1 if $dbus_command;
-my $dbus_pid = -1;
-$dbus_pid = open(my $dbus, '-|', $dbus_command,
-		 'interface=org.gnome.SettingsDaemon.MediaKeys,'.
-		 'path=/org/gnome/SettingsDaemon/MediaKeys,'.
-		 'member=MediaPlayerKeyPressed') or ($has_dbus=0) if $has_dbus;
-my $dbus_readbuf = '';
-Glib::IO->add_watch(fileno $dbus, 'in', \&DBusMonitor) if $has_dbus;
+# Set up DBus
+my $mediakeys;
+eval {
+    use Net::DBus;
+    use Net::DBus::Reactor;
+    $has_dbus = 1;
+
+    # Register the event handler
+    my $bus = Net::DBus->find;
+    my $service = $bus->get_service("org.gnome.SettingsDaemon");
+    # The service moved at some point. Try connecting using both paths.
+    foreach my $objpath ( "/org/gnome/SettingsDaemon/MediaKeys",
+			  "/org/gnome/SettingsDaemon", "" ) {
+	if ( $objpath ) { eval {
+	    $mediakeys = $service->get_object($objpath);
+	    $mediakeys->connect_to_signal(MediaPlayerKeyPressed => \&MediaKey);
+	    1 } and last }
+	else { $mediakeys = undef }
+    }
+
+    # Grab the keys. This should be repeated when the window gets
+    # focus, but I don't do that.
+    GrabMediaKeys();
+
+    # Set up a GTK-compatible Reactor, based on gmusicbrowser
+    my $reactor = Net::DBus::Reactor->main();
+    my %types = (read => 'in', write => 'out', exception => 'err');
+    foreach my $type ( keys %{$reactor->{fds}} ) {
+	my $gtktype = $types{$type} or die;
+	foreach my $fd ( keys %{$reactor->{fds}->{$type}} ) {
+	    Glib::IO->add_watch($fd, $gtktype, \&DBusDispatcher,
+				[$reactor, $type, $fd]);
+	}
+    }
+    my $timeout = $reactor->add_timeout(1, Net::DBus::Callback->new(method => sub {}));
+    $reactor->step;
+    $reactor->remove_timeout($timeout);
+    1;
+} or ($has_dbus = 0);
 
 # Enter the main loop
 Gtk2->main;
 
 # Cleanup
-if ( $has_dbus ) {
-    # Have to kill dbus-monitor or Yocto hangs on exit.
-    kill 15, $dbus_pid if $dbus_pid > 1;
-    close $dbus;
-}
+ReleaseMediaKeys() if $has_dbus;
 SaveConfig();				# Save configuration
 
 # No execution below this line.
@@ -840,7 +863,8 @@ sub ToggleRandom { my ($w) = @_; MPDRandom($w->get_active()?1:0) }
 sub ToggleRepeat { my ($w) = @_; MPDRepeat($w->get_active()?1:0) }
 
 sub MediaKey {
-    my ($foo, $key) = @_;
+    my ($app, $key) = @_;
+    return unless $app eq 'Yocto';
     if ( ($key eq 'Play') )
       { $ongoingtransition = 3; $playbutton->clicked() }
     elsif ( $key eq 'Stop' and $playbutton->get_active() )
@@ -849,6 +873,14 @@ sub MediaKey {
       { $ongoingtransition = 3; MenuNext() }
     elsif ( $key eq 'Previous' )
       { $ongoingtransition = 3; MenuPrev() }
+}
+sub GrabMediaKeys {
+    return unless $has_dbus and $mediakeys;
+    $mediakeys->GrabMediaPlayerKeys('Yocto', 0);
+}
+sub ReleaseMediaKeys {
+    return unless $has_dbus and $mediakeys;
+    $mediakeys->ReleaseMediaPlayerKeys('Yocto');
 }
 
 sub ShowPlaylist {
@@ -889,11 +921,11 @@ END
     exit(0);
 }
 
-sub DBusMonitor {
-    return 0 unless $has_dbus;
-    sysread($dbus, $dbus_readbuf, 1, length($dbus_readbuf));
-    while ( $dbus_readbuf =~ s/^.+signal[^\n]+member=MediaPlayerKeyPressed\s+[^\n]+\s+string "(\S+)"\s*//sg )
-      { MediaKey('',$1) }
+sub DBusDispatcher {
+    my ($reactor,$type,$fd) = @{$_[2]};
+    return 0 unless $reactor->{fds}->{$type}->{$fd}->{enabled};
+    $reactor->{fds}->{$type}->{$fd}->{callback}->invoke;
+    $_->invoke foreach $reactor->_dispatch_hook();
     return 1;
 }
 
@@ -1591,7 +1623,6 @@ sub Prefs {
 	$server->set_border_width(10);
 	$notebook->append_page($server,Gtk2::Label->new('Server'));
 
-	# TODO - Finish implementing Audio and Library tabs
 	$audio->set_border_width(10);
 	$notebook->append_page($audio,Gtk2::Label->new('Audio'));
 
@@ -1898,9 +1929,10 @@ sub MC_RemSel {
     my @sel = map { $_->to_string() } $sel->get_selected_rows();
     foreach my $pos (sort { $b <=> $a } @sel) {
 	if ( $mctype eq 'np' ) { MPDDelete($pos) }
-	elsif ( $mctype eq 'pl' ) { MPDPlDelete($mcarg,$pos); MC_Repopulate() }
+	elsif ( $mctype eq 'pl' ) { MPDPlDelete($mcarg,$pos) }
+	$mctreemodel->remove($mctreemodel->get_iter_from_string($pos));
     }
-    # Consider faking the update
+    MC_Repopulate() if $mctype eq 'pl';	# Playlists are not cached
 }
 
 sub MC_ActivateRow {
@@ -1919,8 +1951,10 @@ sub MC_Reordered {
 			   my $dest = $mctreemodel->get_path($iter)->to_string();
 			   my $src = $mctreemodel->get($iter,3);
 			   if ( $mctype eq 'np' ) { MPDMove($src,$dest) }
-			   elsif ( $mctype eq 'pl' )
-			     { MPDPlMove($mcarg,$src,$dest); MC_Repopulate() }
+			   elsif ( $mctype eq 'pl' ) {
+			       MPDPlMove($mcarg,$src,$dest);
+			       MC_Repopulate();	# Playlists are not cached
+			   }
 			   return 0;
 			   },$iter);
 }
@@ -1928,7 +1962,7 @@ sub MC_Reordered {
 sub MC_Clear {
     $mctreemodel->clear();    # Clear treeview for fast feedback
     if ( $mctype eq 'np' ) { MPDClear() }
-    elsif ( $mctype eq 'pl' ) { MPDPlClear($mcarg); MC_Repopulate() }
+    elsif ( $mctype eq 'pl' ) { MPDPlClear($mcarg) }
 }
 
 sub MC_Delete {
