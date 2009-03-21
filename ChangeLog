@@ -2,6 +2,8 @@ CURRENT
 	- Offer a tooltip when song information is too long to display
 	- Provide better support for multimedia keys using Net::DBus
 	  (Closes #336734)
+	- Replace Config::IniFiles in favor of new code that isn't as
+	  aggravating to use
 	- Various cleanups and bugfixes
 0.51 (31 Jan 2009)
 	- Fix a bug which caused short songs to be skipped

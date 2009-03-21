@@ -22,7 +22,6 @@ use Encode qw/encode decode/;
 use Gtk2;
 use Gtk2::TrayIcon;
 use File::Basename;
-use Config::IniFiles;
 use FindBin;
 use Getopt::Long;
 use IO::Socket::INET;
@@ -51,6 +50,7 @@ while (<DATA>) {
 $license =~ s/\s*$//;			# Remove trailing newlines
 
 # Parse the command line arguments
+Gtk2->init;				# To support GTK options
 my $argvhost;
 my $argvport;
 my $argvpass;
@@ -68,22 +68,23 @@ my $escapehtml = join('',keys(%escapehtml));
 my $has_dbus = 0;
 $|=1;
 $SIG{CHLD} = 'IGNORE';
-Gtk2->init;
 
-# Set the window icons
+# GTK initialization
 Gtk2::Window->set_default_icon_list
   (Gtk2::Gdk::Pixbuf->new_from_file_at_size(findINC('yocto.svg'), 16, 16),
    Gtk2::Gdk::Pixbuf->new_from_file_at_size(findINC('yocto.svg'), 32, 32),
    Gtk2::Gdk::Pixbuf->new_from_file_at_size(findINC('yocto.svg'), 48, 48),
    Gtk2::Gdk::Pixbuf->new_from_file_at_size(findINC('yocto.svg'), 64, 64),
    Gtk2::Gdk::Pixbuf->new_from_file_at_size(findINC('yocto.svg'),128,128));
+my $tipobj = Gtk2::Tooltips->new;	# Tooltips widget
 
 # Load the configuration file
 my $configfile = "$ENV{HOME}/.yocto";
 my %config;
-tie %config, 'Config::IniFiles', ( -file => $configfile,
-				   -import => MakeDefaultConfig() );
-SaveConfig();
+my %configcomments = ();
+LoadConfig();			   # Load default configuration
+LoadConfig($configfile);	   # Load user configuration
+SaveConfig();			   # Save changes (e.g. from upgrades)
 
 # MPD state
 my %status = ();
@@ -119,13 +120,12 @@ my @oldtip = ('','','','','');
 my $oldcover = '';
 my $allowseek = 0;
 my ($wndhover,$transfers,$pbcb) = (0,0,1);
-my $tipobj = Gtk2::Tooltips->new;	# Tooltips widget
 my @labels = ();
 my $timemousein;
 my ($timeadjusting,$timeclicked) = (0,0);
 my ($window,$playbutton,$timescale,$timeswitcher,$timebox,$coverview);
 
-# Preferences
+# Preferences Dialog
 my $prefsdlg;
 my @prefs_stats = ();
 my @prefs_stats_l = ();
@@ -144,6 +144,8 @@ InitIcon();
 InitWindow();
 
 # Load plugins
+#
+# WARNING: Not a general-purpose plugin system. No user serviceable parts.
 our @plugins = ();
 my $plugindir = findINC('yocto-plugins');
 if ( $plugindir and -d $plugindir ) {
@@ -166,8 +168,8 @@ Glib::Timeout->add(1000, sub { Update(); 1 });
 # Set up DBus
 my $mediakeys;
 eval {
-    use Net::DBus;
-    use Net::DBus::Reactor;
+    # Do nothing if DBus is not installed
+    eval "use Net::DBus; use Net::DBus::Reactor; 1" or die;
     $has_dbus = 1;
 
     # Register the event handler
@@ -242,19 +244,16 @@ sub FormatSong {
     my $name	= $song{Name}||'';
     my $artist	= $song{Artist}||'';
     my $album	= $song{Album}||'';
-
     my $fstrip = $file =~ m/^\w+:\/\// ? $file : basename($file);
+
+    # Try to fill in the data fields. For live streaming, use the
+    # Title, Name and URL.
     $tip[0] = $title||$name||$fstrip||'(No Title)';
-    if ( $name ) {			# Streaming
-	if ( $title ) {			# With Track info
-	    $tip[1] = $name;
-	    $tip[2] = $file;
-	}
-	else {				# Without track info
-	    $tip[1] = $file;
-	    $tip[2] = ' ';
-	}
+    if ( $name ) {
+	if ( $title ) { $tip[1] = $name; $tip[2] = $fstrip } # With Track info
+	else { $tip[1] = $fstrip; $tip[2] = ' ' } # Without track info
     }
+    # For non-live media, use the album and artist.
     else {
 	my $trackinfo = '';
 	$album ||= '(No Album)';
@@ -262,13 +261,14 @@ sub FormatSong {
 	  { $tip[1] = sprintf('%s (#%d of %d)', $album, $track,$total) }
 	elsif ( $track ) { $tip[1] = sprintf('%s (#%d)', $album, $track) }
 	else { $tip[1] = $album }
-	$tip[2] = $artist||'(No Artist)';
+	$tip[2] = $artist || '(No Artist)';
     }
-    $_ = escapeHTML($_) foreach @tip;
+    $_ = escapeHTML($_) foreach @tip;	# For Pango markup
     return @tip;
 }
 
 sub FormatTime {
+    # Format seconds as mm:ss (or hh:mm:ss if an hour or longer)
     my ($sec) = @_;
     my $hour = int($sec/3600);
     my $min = int($sec/60)%60;
@@ -568,7 +568,8 @@ sub ConfigureButtonFromStock {
     my ($w,$stock,$size) = @_;
     # Add a stock icon
     $w->add(Gtk2::Image->new_from_stock($stock,$size));
-    # Set the tooltip to the label without the mnemonic
+    # Set the tooltip to the label, but stripping out the mnemonic.
+    # This might not be properly internationalized.
     my $stockt = Gtk2::Stock->lookup($stock)->{label};
     $stockt =~ s/\(_[a-zA-Z]\)|_(?!_)//;
     $tipobj->set_tip($w,$stockt);
@@ -708,6 +709,7 @@ sub InitIcon {
     $eventbox->signal_connect('enter-notify-event' => \&MouseEnter);
     $eventbox->signal_connect('leave-notify-event' => \&MouseLeave);
     $eventbox->signal_connect('scroll-event' => \&ButtonEvent);
+    $icon->signal_connect('destroy' => \&IconDestroyed);
     $eventbox->set_visible_window(0);
 }
 
@@ -763,50 +765,56 @@ sub ButtonEvent {
 	    Update();
 	}
     }
+
     elsif ( $event->button == 1 ) { $playbutton->clicked() } # Toggle playback
 
     elsif ( $event->button == 3 ) {
 	MouseLeave();
-	my $menu = Gtk2::Menu->new(); my $item;
-
-	$item = Gtk2::ImageMenuItem->new('Next A_lbum');
-	$item->signal_connect('activate',\&NextAlbum);
-	$menu->append($item);
-
-	$menu->append(Gtk2::SeparatorMenuItem->new());
-
-	$item = Gtk2::CheckMenuItem->new('Ra_ndom');
-	$item->set_active($status{random});
-	$item->signal_connect('toggled',\&ToggleRandom);
-	$menu->append($item);
-
-	$item = Gtk2::CheckMenuItem->new('R_epeat');
-	$item->set_active($status{repeat});
-	$item->signal_connect('toggled',\&ToggleRepeat);
-	$menu->append($item);
-
-	$menu->append(Gtk2::SeparatorMenuItem->new());
-
-	$item = Gtk2::ImageMenuItem->new_from_stock('gtk-preferences');
-	$item->signal_connect('activate',\&Prefs);
-	$menu->append($item);
-
-	$item = Gtk2::ImageMenuItem->new_from_stock('gtk-help');
-	$item->signal_connect('activate',\&ShowHelp);
-	$menu->append($item);
-
-	$item = Gtk2::ImageMenuItem->new_from_stock('gtk-about');
-	$item->signal_connect('activate',\&AboutBox);
-	$menu->append($item);
-
-	$item = Gtk2::ImageMenuItem->new_from_stock('gtk-quit');
-	$item->signal_connect('activate',sub { Gtk2->main_quit });
-	$menu->append($item);
-
-	$menu->show_all;
-	$menu->popup(undef,undef,undef,undef,$event->button,$event->time);
+	IconMenu($event);
     }
     return 1;
+}
+
+sub IconMenu {
+    my ($event) = @_;
+    my $menu = Gtk2::Menu->new(); my $item;
+
+    $item = Gtk2::ImageMenuItem->new('Next A_lbum');
+    $item->signal_connect('activate',\&NextAlbum);
+    $menu->append($item);
+
+    $menu->append(Gtk2::SeparatorMenuItem->new());
+
+    $item = Gtk2::CheckMenuItem->new('Ra_ndom');
+    $item->set_active($status{random});
+    $item->signal_connect('toggled',\&ToggleRandom);
+    $menu->append($item);
+
+    $item = Gtk2::CheckMenuItem->new('R_epeat');
+    $item->set_active($status{repeat});
+    $item->signal_connect('toggled',\&ToggleRepeat);
+    $menu->append($item);
+
+    $menu->append(Gtk2::SeparatorMenuItem->new());
+
+    $item = Gtk2::ImageMenuItem->new_from_stock('gtk-preferences');
+    $item->signal_connect('activate',\&Prefs);
+    $menu->append($item);
+
+    $item = Gtk2::ImageMenuItem->new_from_stock('gtk-help');
+    $item->signal_connect('activate',\&ShowHelp);
+    $menu->append($item);
+
+    $item = Gtk2::ImageMenuItem->new_from_stock('gtk-about');
+    $item->signal_connect('activate',\&AboutBox);
+    $menu->append($item);
+
+    $item = Gtk2::ImageMenuItem->new_from_stock('gtk-quit');
+    $item->signal_connect('activate',sub { Gtk2->main_quit });
+    $menu->append($item);
+
+    $menu->show_all;
+    $menu->popup(undef,undef,undef,undef,$event->button,$event->time);
 }
 
 sub MouseEnter {
@@ -819,6 +827,12 @@ sub MouseLeave {
     $msghover = 0;
     MakeTransfer();
     return 1;
+}
+
+sub IconDestroyed {
+    # Quit when the tray icon goes away. This avoids the problem of
+    # having multiple copies running inadvertently.
+    Gtk2->main_quit;
 }
 
 # Command handlers and callbacks
@@ -941,48 +955,129 @@ sub NoFunction {
 
 # Configuration file
 
-sub MakeDefaultConfig {
-    my $config = Config::IniFiles->new();
-    $config->newval('Settings','TrackNotify',1);
-    $config->SetParameterComment('Settings','TrackNotify',
-				 '# Show notification when the track changes');
+sub DefaultConfig {
+    # The default configuration file
+    my $config = <<END;
+[Settings]
+# Show notification when the track changes
+TrackNotify=1
+# Show cover art (Requires MusicDirectory)
+ShowCovers=1
 
-    $config->newval('Settings','ShowCovers',1);
-    $config->SetParameterComment('Settings','ShowCovers',
-				 '# Show cover art (Requires MusicDirectory)');
+[External]
+# Set this to MPD's music_directory
+MusicDirectory=
+# Runs whenever the last track is selected
+RefillCommand=
+# Command to start MPD if AutoStart is on
+MPDCommand=mpd
 
-    $config->newval('External','MusicDirectory','');
-    $config->SetParameterComment('External','MusicDirectory',
-				 '# Set this to MPD\'s music_directory');
-
-    $config->newval('External','RefillCommand','');
-    $config->SetParameterComment('External','RefillCommand',
-				 '# Runs whenever the last track is selected');
-
-    $config->newval('External','MPDCommand','mpd');
-    $config->SetParameterComment('External','MPDCommand',
-				 '# Command to start MPD if AutoStart is on');
-
-    $config->newval('Connection','MPDHost','');
-    $config->SetParameterComment('Connection','MPDHost',
-				 '# The MPD host (Default is localhost)');
-
-    $config->newval('Connection','MPDPort','');
-    $config->SetParameterComment('Connection','MPDPort',
-				 '# The MPD port (Default is 6600)');
-
-    $config->newval('Connection','MPDPass','');
-    $config->SetParameterComment('Connection','MPDPass',
-				 '# Password for MPD (If necessary)');
-
-    $config->newval('Connection','AutoStart',0);
-    $config->SetParameterComment('Connection','AutoStart',
-				 '# Try starting MPD if connection fails');
-
-    return $config;
+[Connection]
+# The MPD host (For remote access only)
+MPDHost=
+# The MPD port (Default is 6600)
+MPDPort=
+# Password for MPD (If necessary)
+MPDPass=
+# Try starting MPD if connection fails
+AutoStart=0
+END
+    my @config = ();
+    push @config, $1 while $config =~ m/^(.*?\r?\n)/gm;
+    return \@config;
 }
 
-sub SaveConfig { tied(%config)->RewriteConfig() }
+sub LoadConfig {
+    # Read the configuration file into the hash. Overwrite
+    # existing items, but do not remove them.
+    my ($configfile) = @_;
+    my @input;
+    if ( $configfile and open F, '<', $configfile ) { @input = <F>; close F }
+    elsif ( $configfile ) { return }
+    else { @input = @{DefaultConfig()} }
+
+    my $section = '';
+    my $comment = '';
+    foreach my $l ( @input ) {
+	if ( $l =~ m/^\s*(\w+?)\s*=\s*(.*?)\s*$/ and $section) {
+	    $config{$section}{$1} = $2;
+	    next unless $comment;
+	    # Save comments from the default configuration file
+	    $configcomments{$section}{$1} = $comment;
+	    $comment = '';
+	}
+	elsif ( $l =~ m/^\s*\[(\w+?)\]\s*$/ ) { $section = $1 }
+	elsif ( !$configfile and $l =~ m/^\s*#\s*(.*?)\s*$/ ) { $comment = $1 }
+    }
+    close F;
+}
+
+sub SaveConfig {
+    # Write a new configuration file.
+    # - Do not write a new file if there are no changes.
+    # - Preserve order and comments.
+    my @input;
+    my @output = ();
+    my $changed = 0;
+    my $section = '';
+    my @writtensec = ();
+    my %written = ();
+    # Load the old config file, or else the default config
+    if ( open F, '<', $configfile ) { @input = <F>; close F }
+    else { @input = @{DefaultConfig()}; $changed = 1 }
+
+    foreach my $l ( @input, '' ) {
+	# Write a value
+	if ( $l =~ m/^(\s*)(\w+?)(\s*=\s*)(.*?)(\s*)$/ ) {
+	    my ($a,$key,$b,$value,$c) = ($1,$2,$3,$4,$5);
+	    # Write out this key, checking if there were changes
+	    if ( exists($config{$section}) and exists($config{$section}{$key})
+		 and $config{$section}{$key} ne $value ) { $changed = 1 }
+	    push @output, "$a$key$b$config{$section}{$key}$c";
+	    $written{$section}{$key} = 1;
+	}
+	# Handle section boundary
+	elsif ( $l =~ m/^(\s*\[)(\w+?)(\]\s*)$/ or !$l ) {
+	    my ($a,$sec,$b) = ($1,$2,$3);
+	    if ( $section and exists($config{$section}) ) {
+		# Write out any leftover keys for the previous section.
+		foreach my $k ( keys %{$config{$section}} ) {
+		    next if exists($written{$section}{$k});
+		    push @output, "# $configcomments{$section}{$k}\n"
+		      if exists($configcomments{$section}) and
+			exists($configcomments{$section}{$k});
+		    push @output, "$k=$config{$section}{$k}\n";
+		    $written{$section}{$k} = 1;
+		    $changed = 1;	# File has changed
+		}
+	    }
+	    last unless $l;
+	    push @output, "$a$sec$b";
+	    $section = $sec;
+	    $section = '' if exists($written{$section}); # Don't write it twice
+	}
+	else { push @output, $l }
+    }
+    # Write out any leftover sections
+    foreach my $sec ( keys %config ) {
+	next if exists($written{$sec});
+	push @output, "\n" unless @output and $output[-1] =~ m/^\s*\n$/;
+	push @output, "[$sec]\n";
+	foreach my $k ( keys %{$config{$sec}} ) {
+	    push @output, "# $configcomments{$sec}{$k}\n"
+	      if exists($configcomments{$sec}) and
+		exists($configcomments{$sec}{$k});
+	    push @output, "$k=$config{$sec}{$k}\n";
+	}
+	$changed = 1;			# File has changed
+    }
+    # Save the file if it changed
+    if ( $changed ) {
+	open F, '>', $configfile or warn "Failed to open $configfile: $!\n";
+	print F @output;
+	close F or warn "Failed to close $configfile: $!\n";
+    }
+}
 
 # MPD Access functions
 sub MPDConnect {
@@ -1681,7 +1776,6 @@ sub Prefs {
 	else { MPDConnect(1) }
     }
     elsif ( $r eq 'accept' ) { SaveConfig() } # Save preferences
-    #if ( $r eq 'accept' ) { }
 }
 
 sub InvalidatePrefs {
@@ -1718,7 +1812,7 @@ sub MC_Show {
 	$mcsearch->set_activates_default(0);
 	$mcsearch->signal_connect('activate', sub { $mcquery = $mcsearch->get_text(); $mcsel->set_active(-1); $mcsel->set_active(1); });
 	$topbox->pack_end($mcsearch,0,0,0);
-	my $mcsearchlabel = Gtk2::Label->new('   _Search Library: ');
+	my $mcsearchlabel = Gtk2::Label->new('   Search _Library: ');
 	$mcsearchlabel->set_use_underline(1);
 	$mcsearchlabel->set_mnemonic_widget($mcsearch);
 	$topbox->pack_end($mcsearchlabel,0,0,0);

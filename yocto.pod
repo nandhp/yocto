@@ -61,7 +61,8 @@ Display version information.
 
 =back
 
-=cut
+In addition, Yocto also supports the standard GTK options documented
+in L<gtk-options(7)>.
 
 =head1 SERVER CONNECTION
 
@@ -96,7 +97,8 @@ specified by setting B<MPD_HOST> to I<password>B<@>I<host>
 
 =item F<~/.yocto>
 
-User configuration file. See L</"CONFIGURATION">.
+User configuration file. Most of the options available in this file
+can also be found in the Yocto Preferences dialog box.
 
 =back
 

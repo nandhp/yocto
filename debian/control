@@ -9,9 +9,8 @@ Section: sound
 Priority: optional
 Architecture: all
 Essential: no
-Depends: ${perl:Depends}, libgtk2-perl, libgtk2-trayicon-perl,
- libconfig-inifiles-perl
-Suggests: mpd
+Depends: ${perl:Depends}, libgtk2-perl, libgtk2-trayicon-perl
+Suggests: mpd, libnet-dbus-perl
 Enhances: mpd
 Provides: mpd-client
 Description: An MPD Client for the system notification area
