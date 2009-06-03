@@ -66,16 +66,31 @@ GetOptions('host|h=s' => \$argvhost,
 my %escapehtml = ('<'=>'&lt;', '>'=>'&gt;', '&'=>'&amp;', '"'=>'&quot;');
 my $escapehtml = join('',keys(%escapehtml));
 my $has_dbus = 0;
+my $iconfile = findINC('yocto.svg');
 $|=1;
 $SIG{CHLD} = 'IGNORE';
 
+# FIXME - For tracing
+my %callbacknames = ();
+if ( $trace ) { foreach ( [\&MPDResponseSimple, 'MPDResponseSimple'],
+			  [\&MPDResponseStatus, 'MPDResponseStatus'],
+			  [\&MPDResponseStats, 'MPDResponseStats'],
+			  [\&MPDResponseInfo, 'MPDResponseInfo'],
+			  [\&MPDResponsePlChanges, 'MPDResponsePlChanges'],
+			  [\&MPDResponseOutputs, 'MPDResponseOutputs'],
+			  [\&MPDResponseMCSongList, 'MPDResponseMCSongList'],
+			  [\&MPDResponseMCList, 'MPDResponseMCList'],
+			  [\&MPDResponseWelcome, 'MPDResponseWelcome'],
+			  [\&MPDResponseMCSave, 'MPDResponseMCSave'] )
+		  {$callbacknames{$_->[0]} = $_->[1] } }
+
 # GTK initialization
 Gtk2::Window->set_default_icon_list
-  (Gtk2::Gdk::Pixbuf->new_from_file_at_size(findINC('yocto.svg'), 16, 16),
-   Gtk2::Gdk::Pixbuf->new_from_file_at_size(findINC('yocto.svg'), 32, 32),
-   Gtk2::Gdk::Pixbuf->new_from_file_at_size(findINC('yocto.svg'), 48, 48),
-   Gtk2::Gdk::Pixbuf->new_from_file_at_size(findINC('yocto.svg'), 64, 64),
-   Gtk2::Gdk::Pixbuf->new_from_file_at_size(findINC('yocto.svg'),128,128));
+  (Gtk2::Gdk::Pixbuf->new_from_file_at_size($iconfile, 16, 16),
+   Gtk2::Gdk::Pixbuf->new_from_file_at_size($iconfile, 32, 32),
+   Gtk2::Gdk::Pixbuf->new_from_file_at_size($iconfile, 48, 48),
+   Gtk2::Gdk::Pixbuf->new_from_file_at_size($iconfile, 64, 64),
+   Gtk2::Gdk::Pixbuf->new_from_file_at_size($iconfile,128,128));
 my $tipobj = Gtk2::Tooltips->new;	# Tooltips widget
 
 # Load the configuration file
@@ -93,7 +108,10 @@ my %stats = ( db_update => 0 );
 my @playlist = ();
 my ($mpderror,$mpderrid) = (undef,0);
 my $sock;
-if ( (my $rc = MPDConnect(1)) <= 0 ) { exit } # Connect to MPD
+my $connecttime = 0;
+my $iowatch;
+my $iobuffer;
+my @rq = ();
 my %states = (play=>'Playing',pause=>'Paused',stop=>'Stopped');
 my $savedstate = '';
 my $savedsongid = -1;
@@ -108,9 +126,10 @@ my %misc = ();
 
 # Notification Icon
 my $iconsize = 0;
-my $iconpixbuf = undef;
-my $iconfn = '';
-my $oldiconfn = '';
+my @iconcolor = (-1,-1,-1);
+my @iconpixbuf = ();
+my $iconmode = 0;
+my $oldiconmode = -1;
 my ($msgvisible,$msghover,$msgtimeout) = (0,0,0);
 my ($icon,$eventbox);
 
@@ -132,7 +151,8 @@ my @prefs_stats_l = ();
 my $outputs_populated = 0;
 
 # Music Chooser
-my ($mcwnd,$mcsel,$mcselmodel,$mctree,$mctreemodel,$mcview,$mcsearch,$mcquery);
+my ($mcwnd, $mcsel, $mcselmodel, $mctree, $mctreemodel, $mcview, $mcsearch,
+    $mcquery, $mcsearchlabel);
 my ($mcbutbox);
 my $mcvisible = 0;
 my ($mctype,$mcarg) = ('','');
@@ -159,10 +179,13 @@ if ( $plugindir and -d $plugindir ) {
     }
 }
 
+
 # Show everything
 $icon->show_all;
-Update();
-Glib::Timeout->add(1000, sub { Update(); 1 });
+MPDDisconnect();
+MenuConnect();				# Connect to MPD
+UpdateTimeout();
+Glib::Timeout->add(1000, sub { UpdateTimeout(); 1 });
 #Glib::Timeout->add(1000*60, sub { Gtk2->main_quit }); # For Profiling
 
 # Set up DBus
@@ -186,7 +209,7 @@ eval {
     }
 
     # Grab the keys. This should be repeated when the window gets
-    # focus, but I don't do that.
+    # focus, but I don't really have any way to do that.
     GrabMediaKeys();
 
     # Set up a GTK-compatible Reactor, based on gmusicbrowser
@@ -212,7 +235,7 @@ Gtk2->main;
 ReleaseMediaKeys() if $has_dbus;
 SaveConfig();				# Save configuration
 
-# No execution below this line.
+# Functions only below this line.
 
 # Utility and general functions
 
@@ -268,48 +291,77 @@ sub FormatSong {
 }
 
 sub FormatTime {
-    # Format seconds as mm:ss (or hh:mm:ss if an hour or longer)
-    my ($sec) = @_;
+    # Format seconds as mm:ss, or hh:mm:ss if an hour or longer (and
+    # subdivide the hours into days if requested and necessary)
+    my ($sec,$usedays) = @_;
     my $hour = int($sec/3600);
     my $min = int($sec/60)%60;
     $sec = $sec%60;
     my $shour = sprintf('%d:',$hour);
     my $smin = sprintf($hour?'%02d':'%d',$min);
+    $shour = sprintf('%d days, %d:', int($hour/24), $hour%24)
+      if $usedays and $hour >= 24;
     sprintf('%s%s:%02d',$hour?$shour:'',$smin,$sec);
 }
 
-sub Update {
-    MPDAuth(); # Check for authentication error, possibly requesting password
-    if ( !$sock or !MPDStatus() ) {
-	MPDReconnect();
-	HideTooltip();
+sub UpdateTimeout {
+    # FIXME - Remove old code
+    #MPDAuth(); # Check for authentication error, possibly requesting password
+
+    # Not Connected
+    if ( !$sock ) {
+	MakeTooltip();
+	MPDReconnect() if $reconnectin;
 	return;
     }
 
-    # Show the state icon
-    $iconfn = ($status{state} eq 'play') ? 'yocto.svg' : 'yocto-off.svg';
-    if ( $oldiconfn ne $iconfn ) { IconExpose() }
+    Update();
+}
 
+sub Update {
+    # Request updates
+    MPDPlChanges(-1) if $savedplaylist == -1;
+    MPDStatus();
+}
+
+sub UpdateStatus {
     # Update the playlist
-    if ( $savedplaylist ne $status{playlist} ) {
-	my @changes = MPDPlaylistChanges($savedplaylist);
-	foreach ( @changes ) {
-	    $playlist[$_->{Pos}] = $_;
-	}
-	pop @playlist while @playlist > $status{playlistlength};
+    if ( $savedplaylist == -1 ) { $savedplaylist = $status{playlist} }
+    elsif ( $status{playlist} ne $savedplaylist ) {
+	MPDPlChanges($savedplaylist);
+	$savedplaylist = -1;
+	return;	   # Wait for an up-to-date playlist before continuing
     }
 
-    # Show the track info
-    $pbcb = -1;
-    $playbutton->set_active($status{state} eq 'play');
-    MakeTooltip();
-    $pbcb = 1;
+    if ( $status{state} ne $savedstate ) {
+	my $playing = $status{state} eq 'play';
 
-    # Show or hide the popup window
-    my $transition = DuringTransition();
-    HideTooltip() if !$transition and $transition != $savedtransition;
-    ShowTooltip(1) if $transition;
-    ShowTooltip(0);
+	# Show the state icon
+	$iconmode = $playing ? 1 : 0;
+	if ( $oldiconmode ne $iconmode ) { IconExpose() }
+
+	# Show the track info
+	$pbcb = -1; $playbutton->set_active($playing); $pbcb = 1;
+
+	# Show the tooltip
+	StartTransition(3) if $savedstate;
+    }
+
+    MakeTooltip();
+
+    if ( $savedsongid ne (defined($status{songid})?$status{songid}:-1)
+	 or $savedstate ne $status{state}||'' ) {
+	# or $savedplaylist ne $status{playlist}
+	InvalidatePrefs();
+    }
+
+    # Update the MusicChooser
+    if ( $savedsongid ne (defined($status{songid})?$status{songid}:-1) and
+	 $mctype eq 'np' ) { $mcscrollnext = 0; MC_Repopulate() }
+
+    # Update the stats
+    if ( $dboldupdate eq $stats{db_update} and $dbwait > 0 )
+      { MPDStats(); $dbwait-- }
 
     # Refill the playlist
     my $refill = $config{External}{RefillCommand};
@@ -320,46 +372,62 @@ sub Update {
 
     &$_($status{state}) foreach @plugins;
 
-    if ( $savedsongid ne (defined($status{songid})?$status{songid}:-1)
-	 or $savedstate ne $status{state}||''
-	 or $savedplaylist ne $status{playlist} ) {
-	InvalidatePrefs();
-	if ( $mctype eq 'np' ) { $mcscrollnext = 0; MC_Repopulate() }
-    }
-
-    # Update stats
-    if ( $dboldupdate eq $stats{db_update} and $dbwait > 0 ) {
-	MPDStats();
-	$prefs_stats_l[0] = sprintf("    Artists: %d",$stats{artists});
-	$prefs_stats_l[1] = sprintf("    Albums: %d",$stats{albums});
-	$prefs_stats_l[2] = sprintf("    Songs: %d",$stats{songs});
-	$prefs_stats_l[3] = sprintf("Last refresh: %s",
-				    scalar localtime($stats{db_update}));
-	if ( @prefs_stats )
-	  { $prefs_stats[$_]->set_text($prefs_stats_l[$_]) foreach 0..3 }
-	$dbwait--;
-    }
-
     # Save the state to detect changes
     $savedstate = $status{state}||'';
     $savedsongid = defined($status{songid})?$status{songid}:-1;
-    $savedtransition = $transition;
-    $savedplaylist = $status{playlist};
+}
+
+sub UpdatePlaylist {
+    # Apply the changes to the playlist
+    my @changes = @_;
+    foreach ( @changes ) {
+	$playlist[$_->{Pos}] = $_;
+    }
+    if ( exists($status{playlistlength}) )
+      { pop @playlist while @playlist > $status{playlistlength} }
+    $savedplaylist = exists($status{playlist}) ? $status{playlist} : -1;
+    $savedsongid = -1;
+
+    # Update playlist display in MusicChooser
+    if ( $mctype eq 'np' ) { $mcscrollnext = 0; MC_Repopulate() }
+
+    # Now, make sure everything else is using this information
+    UpdateStatus() if $savedplaylist > -1;
+}
+
+sub UpdateStats {
+    $prefs_stats_l[0] = sprintf("Artists: %d",$stats{artists});
+    $prefs_stats_l[1] = sprintf("Albums: %d",$stats{albums});
+    $prefs_stats_l[2] = sprintf("Songs: %d",$stats{songs});
+    $prefs_stats_l[3] = sprintf("Total playing time: %s",
+				FormatTime($stats{db_playtime},1)); # Use days
+    $prefs_stats_l[4] = sprintf("Last refresh: %s",
+				scalar localtime($stats{db_update}));
+    if ( @prefs_stats )
+      { $prefs_stats[$_]->set_text($prefs_stats_l[$_]) foreach 0..4 }
 }
 
 sub MakeTooltip {
-    my $state = $states{$status{state}};
+    my $state = $states{$status{state}||''};
     my %song  = ();
     %song = %{$playlist[$status{song}]}
       if defined($status{song}) and $playlist[$status{song}];
     my @timeinfo = ();
 
-    if ( !$song{file} || $status{state} eq 'stop' )
+    my $trackchanged =
+      ($savedstate ne ($status{state}||'') or
+       $savedsongid != (defined($status{songid})?$status{songid}:-1));
+
+    if ( !$sock ) {
+	@tip = ('Not Connected',
+		$mpderror ? sprintf('Disconnected: %s',$mpderror) : '',
+		$reconnectin ? sprintf('Reconnecting in %s seconds...',
+				       $reconnectin-1) : '', '', 'Playlist');
+    }
+    elsif ( !$song{file} || $status{state} eq 'stop' )
       { @tip = ('Not Playing','','','','Playlist') }
     else {
-	if ( $status{playlist} ne $savedplaylist or
-	     $status{songid} ne $savedsongid or
-	     $status{state} ne $savedstate ) {
+	if ( $trackchanged or $status{playlist} ne $savedplaylist ) {
 	    @tip = FormatSong(%song);
 	    $tip[4] = sprintf('%d of %d',
 			      $status{song}+1, $status{playlistlength});
@@ -373,8 +441,7 @@ sub MakeTooltip {
     UpdateLabels();
 
     # Cover art
-    if ( $savedsongid ne (defined($status{songid})?$status{songid}:-1)
-	 or $savedstate ne $status{state} ) {
+    if ( $trackchanged ) {
 	my $cover = '';
 	if ( !$config{External}{MusicDirectory}
 	     || !$config{Settings}{ShowCovers} ) { # Covers off or unavailable
@@ -397,8 +464,7 @@ sub MakeTooltip {
     # Time scale
     if ( $timescale ) {
 	$timeadjusting = 1;
-	if ( $savedsongid ne (defined($status{songid})?$status{songid}:-1)
-	     or $savedstate ne $status{state} ) {
+	if ( $trackchanged ) {
 	    $allowseek =		# No seek if no length information
 	      ( @timeinfo == 2 && $timeinfo[1] && defined($timeinfo[0])
 		&& $timeinfo[1] >= $timeinfo[0] ) ? 1 : 0;
@@ -408,6 +474,8 @@ sub MakeTooltip {
 	$timescale->set_value($timeinfo[0]||0) unless $timeclicked;
 	$timeadjusting = 0;
     }
+
+    HideTooltip();			# Handle all popup display
 }
 
 sub SetCover {
@@ -582,6 +650,9 @@ sub UpdateLabels {
 	$labels[$_]->set_markup($idx == 0 ? $wrapped: $tip[$idx])
 	  if $tip[$idx] ne $oldtip[$idx];
     }
+    if ( ($status{state}||'') eq 'play' and $tip[0] ne $oldtip[0] ) {
+	StartTransition(3); # Notify of changing title, e.g. for streaming
+    }
     @oldtip = @tip;
 }
 
@@ -604,11 +675,6 @@ sub EllipsizedLabelTooltip {
 sub PopupExpose {
     my $win = $window->window;
     my ($w,$h) = $window->get_size();
-    #my ($fgc) = $window->get_style()->fg_gc('normal');
-    #my ($bgc) = $window->get_style()->bg_gc('normal');
-    #$win->draw_rectangle($fgc, 1, 0, 0,$w  , $h  );
-    #$win->draw_rectangle($bgc, 1, 1, 1,$w-2, $h-2);
-
     # Draw a fancy etched border
     $window->get_style()->paint_box($win, 'normal', 'out', undef, $window,
 				    '', 0, 0, $w, $h);
@@ -647,7 +713,7 @@ sub ShowTooltip {
 
 sub HideTooltip {
     $msgtimeout = 0;
-    return if $msghover or $wndhover or DuringTransition();
+    return ShowTooltip(1) if DuringTransition() or $msghover or $wndhover;
     $msgvisible = 0;
     $window->hide;
     # In case the leave event wasn't called, which appears to happen
@@ -656,28 +722,28 @@ sub HideTooltip {
     SetTimebox($timebox);
 }
 
+sub StartTransition {
+    my ($t) = @_;
+    return unless $t >= 1 and $config{Settings}{TrackNotify};
+    $t += time;
+    $ongoingtransition = $t if $t > $ongoingtransition;
+    ShowTooltip(1);
+}
+
 sub DuringTransition {
     return $ongoingtransition = 0 if !$config{Settings}{TrackNotify} or !$sock;
-    return $ongoingtransition-- if $ongoingtransition;
-    return 0 if $status{state} ne 'play';
-    return $ongoingtransition = 3 if $savedstate ne $status{state};
+    return 1 if $ongoingtransition > time;
+    return 0 if ($status{state}||'') ne 'play';
     my @timeinfo = split(':',$status{time});
     if ( #( $timeinfo[1] and $timeinfo[1]-$timeinfo[0] <= 1 ) or
 	 $timeinfo[0] <= 3 ) {
 	return 1;
     }
-}
-
-sub WndEnter {
-    $wndhover = 1;
     return 0;
 }
 
-sub WndLeave {
-    $wndhover = 0;
-    MakeTransfer();
-    return 0;
-}
+sub WndEnter { $wndhover = 1;                 return 0 }
+sub WndLeave { $wndhover = 0; MakeTransfer(); return 0 }
 
 sub MakeTransfer {
     #$transfers++;
@@ -716,27 +782,60 @@ sub InitIcon {
 sub IconExpose {
     my ($size) = $icon->get_size_request();
     my $win = $eventbox->window;
-    if ( !$iconpixbuf or ($iconsize ne $size) or ($oldiconfn ne $iconfn) ) {
-	$iconpixbuf = Gtk2::Gdk::Pixbuf->new_from_file_at_size
-	  (findINC($iconfn),$size,$size);
-    }
+    # Get the preferred foreground color
     my ($fgc) = $icon->get_style()->fg_gc('normal');
+    my $color = $icon->get_style()->fg('normal');
+    my @cval = (int($color->red*255/65535), int($color->green*255/65535),
+		int($color->blue*255/65535));
+    my $colorchanged = 0;
+    for ( 0..2 ) { $colorchanged = 1 if $cval[$_] ne $iconcolor[$_] }
+    if ( @iconpixbuf != 2 or ($iconsize ne $size) or $colorchanged ) {
+	my $pixbuf = Gtk2::Gdk::Pixbuf->new_from_file_at_size
+	  ($iconfile,$size,$size);
+	# A possibly fragile routine to munge the alpha channel to
+	# produce a "paused" version of the logo. First try to ensure
+	# the image is RGBA, then (for each channel) munge every
+	# fourth character in the string. There is very little
+	# documentation on how to do any of this.
+	my ($cw,$ch) = ($pixbuf->get_width, $pixbuf->get_height);
+	my ($cr,$ccs) = ($pixbuf->get_rowstride, $pixbuf->get_colorspace);
+	my ($cha,$cnc) = ($pixbuf->get_has_alpha, $pixbuf->get_n_channels);
+	if ( !$cha or $cnc != 4 or $ccs ne 'rgb' ) {
+	    warn "Logo cannot be edited: Wrong colorspace or alpha channel";
+	    # We keep going in any case, but let's try adding an alpha
+	    # channel, just in case that will help.
+	    $pixbuf = $pixbuf->add_alpha(0,0,0,0);
+	}
+	my $pixels = $pixbuf->get_pixels();
+	# Tint the icon to the user's preferred forground color
+	if ( $color ) {
+	    for my $channel ( 0..2 ) {
+		for ( my $i = $channel; $i < length($pixels); $i+=4 ) {
+		    substr($pixels,$i,1,chr($cval[$channel]));
+		}
+	    }
+	    $pixbuf = Gtk2::Gdk::Pixbuf->new_from_data
+	      ($pixels, $ccs, 1, 8, $cw, $ch, 4*$cw);
+	}
+	# Generate the "paused" image by adjusting the alpha channel
+	for ( my $i = 3; $i < length($pixels); $i+=4 ) {
+	    substr($pixels,$i,1,chr(int(ord(substr($pixels,$i,1))*0.25)));
+	}
+	my $offpixbuf = Gtk2::Gdk::Pixbuf->new_from_data
+	  ($pixels, $ccs, 1, 8, $cw, $ch, 4*$cw);
+	@iconpixbuf = ($offpixbuf, $pixbuf);
+	$iconsize = $size;
+	@iconcolor = @cval;
+    }
     return unless $fgc;
 
     # Use clear() instead of draw_rect($bg_gc) because the latter
     # doesn't work with a transparent panel. This behavior of
     # Gtk2::Gdk::Window::clear() is not documented anywhere.
     $win->clear();
-    $win->draw_pixbuf($fgc, $iconpixbuf, 0, 0, 0, 0, $size, $size, 'none',0,0);
-    $oldiconfn = $iconfn;
-
-    #my ($bgc) = $icon->get_style()->bg_gc('normal');
-    # Don't waste a get_size call on this. After all, the size request
-    # should be accurate, and if it's not it will be next time.
-    #my ($w,$h) = $win->get_size();
-    #print " $w $h $size\n";
-    #$w = $size if $size > $w;
-    #$h = $size if $size > $h;
+    $win->draw_pixbuf($fgc, $iconpixbuf[$iconmode],
+		      0, 0, 0, 0, $size, $size, 'none',0,0);
+    $oldiconmode = $iconmode;
 }
 
 sub IconAllocate {
@@ -754,11 +853,13 @@ sub IconAllocate {
 sub ButtonEvent {
     my ($obj,$event) = @_;
     if ( $event->type eq 'scroll' ) {
-	# Wheel up/down to adjust volume: highly unorthodox (but not uncommon)
+	# Wheel up/down to adjust volume: highly unorthodox, according
+	# to the HIG folks, but most music players do something with
+	# the wheel, either for volume or track switching.
 	if ( $sock && defined($status{volume}) ) {
-	    if ( $event->direction eq 'up' )
+	    if ( $event->direction eq 'up' and $status{volume} < 100 )
 	      { MPDVolume($status{volume}+1) }
-	    elsif ( $event->direction eq 'down' )
+	    elsif ( $event->direction eq 'down' and $status{volume} > 0 )
 	      { MPDVolume($status{volume}-1) }
 	    elsif ( $event->direction eq 'right' ) { MPDNext() }
 	    elsif ( $event->direction eq 'left' ) { MPDPrev() }
@@ -787,19 +888,28 @@ sub IconMenu {
 
     $item = Gtk2::CheckMenuItem->new('Ra_ndom');
     $item->set_active($status{random});
+    $item->set_sensitive($sock ? 1 : 0);
     $item->signal_connect('toggled',\&ToggleRandom);
     $menu->append($item);
 
     $item = Gtk2::CheckMenuItem->new('R_epeat');
     $item->set_active($status{repeat});
+    $item->set_sensitive($sock ? 1 : 0);
     $item->signal_connect('toggled',\&ToggleRepeat);
     $menu->append($item);
 
     $menu->append(Gtk2::SeparatorMenuItem->new());
 
     $item = Gtk2::ImageMenuItem->new_from_stock('gtk-preferences');
-    $item->signal_connect('activate',\&Prefs);
+    $item->signal_connect('activate',\&MenuPrefs);
     $menu->append($item);
+
+    $item = Gtk2::ImageMenuItem->new_from_stock
+      ($sock ? 'gtk-disconnect' : 'gtk-connect');
+    $item->signal_connect('activate',$sock ? \&MPDDisconnect : \&MenuConnect);
+    $menu->append($item);
+
+    $menu->append(Gtk2::SeparatorMenuItem->new());
 
     $item = Gtk2::ImageMenuItem->new_from_stock('gtk-help');
     $item->signal_connect('activate',\&ShowHelp);
@@ -808,6 +918,8 @@ sub IconMenu {
     $item = Gtk2::ImageMenuItem->new_from_stock('gtk-about');
     $item->signal_connect('activate',\&AboutBox);
     $menu->append($item);
+
+    $menu->append(Gtk2::SeparatorMenuItem->new());
 
     $item = Gtk2::ImageMenuItem->new_from_stock('gtk-quit');
     $item->signal_connect('activate',sub { Gtk2->main_quit });
@@ -839,21 +951,30 @@ sub IconDestroyed {
 
 sub NextAlbum {
     my $refill = $config{External}{RefillCommand};
-    MPDStatus();
     my $album = $playlist[$status{song}]{Album}||'';
-    while ( 1 ) {
-	MPDStatus();
-	my %song = MPDCurrentSong();
-	last if ($song{Album}||'') ne $album;
-	if ( $status{song}+1 == $status{playlistlength} ) {
-	    if ( $status{repeat} || $status{random} ) { MPDNext(); last }
-	    elsif ( $refill ) { system $refill }
-	    MPDStatus();
-	    last if $status{song}+1 == $status{playlistlength}; # Failed
-	}
-	MPDNext();
+    my $found = -1;
+    foreach ( $status{song}+1..$#playlist ) {
+	if ( ($playlist[$_]{Album}||'') ne $album ) { $found = $_; last }
+    }
+    # If random mode is turned on, just go to the next track
+    if ( $status{random} ) { MPDNext() }
+    # If there is a suitable track coming up, seek to it
+    elsif ( $found >= 0 ) { MPDSeek($found, 0) }
+    # Otherwise, if repeat mode is turned on, wrap around to the first track
+    elsif ( $status{repeat} ) { MPDSeek(0, 0) }
+    # If all else fails, run the refill command, and go to the next track
+    else {
+	MPDSeek($#playlist, 0);
+	system $refill if $refill;
+	MPDNext();	# MPD will stop if refill fails or is disabled
     }
 }
+
+sub MenuConnect {
+    if ( $config{Connection}{AutoConnect} ) { MPDConnect(1) }
+    else { Prefs(1) }
+}
+sub MenuPrefs { Prefs(0) }
 
 sub MenuPrev { MPDPrev(); Update() }
 sub MenuNext { MPDNext(); Update() }
@@ -865,9 +986,12 @@ sub PlayButton {
 	$pbcb = 0;
     }
     if ( $pbcb != 1 ) { return }
-    elsif ( !$b->get_active() ) { # Make the state come into effect:
-	my %song = MPDCurrentSong();
-	if ( $song{Name} ) { MPDStop() }
+    # Make the state come into effect (e.g. !active means to pause)
+    elsif ( !$b->get_active() && defined($status{song}) ) {
+	my %song = %{$playlist[$status{song}]};
+	my $streaming = ( (exists($song{Name}) && $song{Name}) or # Icecast
+			  ($song{file}||'') =~ m/^\w+:\/\// ); # MP3-over-HTTP
+	if ( $streaming ) { MPDStop() }
 	else { MPDPause() }
     }
     else { MPDPlay() }
@@ -880,13 +1004,13 @@ sub MediaKey {
     my ($app, $key) = @_;
     return unless $app eq 'Yocto';
     if ( ($key eq 'Play') )
-      { $ongoingtransition = 3; $playbutton->clicked() }
+      { StartTransition(3); $playbutton->clicked() }
     elsif ( $key eq 'Stop' and $playbutton->get_active() )
-      { $ongoingtransition = 3; $playbutton->clicked() }
+      { StartTransition(3); $playbutton->clicked() }
     elsif ( $key eq 'Next' )
-      { $ongoingtransition = 3; MenuNext() }
+      { StartTransition(3); MenuNext() }
     elsif ( $key eq 'Previous' )
-      { $ongoingtransition = 3; MenuPrev() }
+      { StartTransition(3); MenuPrev() }
 }
 sub GrabMediaKeys {
     return unless $has_dbus and $mediakeys;
@@ -979,6 +1103,8 @@ MPDHost=
 MPDPort=
 # Password for MPD (If necessary)
 MPDPass=
+# Try to connect to MPD at startup
+AutoConnect=1
 # Try starting MPD if connection fails
 AutoStart=0
 END
@@ -1022,13 +1148,14 @@ sub SaveConfig {
     my $section = '';
     my @writtensec = ();
     my %written = ();
+    my $chmod = 0;
     # Load the old config file, or else the default config
     if ( open F, '<', $configfile ) { @input = <F>; close F }
-    else { @input = @{DefaultConfig()}; $changed = 1 }
+    else { @input = @{DefaultConfig()}; $changed = 1; $chmod = 1 }
 
     foreach my $l ( @input, '' ) {
 	# Write a value
-	if ( $l =~ m/^(\s*)(\w+?)(\s*=\s*)(.*?)(\s*)$/ ) {
+	if ( $l =~ m/^(\s*)(\w+?)(\s*=\s*)(.*?)(\s+)$/ ) {
 	    my ($a,$key,$b,$value,$c) = ($1,$2,$3,$4,$5);
 	    # Write out this key, checking if there were changes
 	    if ( exists($config{$section}) and exists($config{$section}{$key})
@@ -1071,39 +1198,84 @@ sub SaveConfig {
 	}
 	$changed = 1;			# File has changed
     }
-    # Save the file if it changed
+    # Save the file if it changed. Chmod the file if it didn't exist before.
     if ( $changed ) {
 	open F, '>', $configfile or warn "Failed to open $configfile: $!\n";
+	eval { chmod 0600, $configfile } if $chmod; # chmod newly created file
 	print F @output;
 	close F or warn "Failed to close $configfile: $!\n";
     }
 }
 
 # MPD Access functions
-sub MPDConnect {
+sub MPDReset {
+    ClearMPDError();			# Clear the error
+    MPDDisconnect();
+}
+
+sub MPDDisconnect {
+    if ( $sock ) { close($sock); undef $sock }
+    if ( $iowatch ) { Glib::Source->remove($iowatch); undef $iowatch }
+
+    # Reset the status
+    %status = ();
     %mpd = ();
-    $mpderror = undef;
-    $mpderrid = 0;
+    %stats = ( db_update => 0 );
+    @rq = ();
+    @playlist = ();
+    MakeTooltip();
+    $savedstate = '';
+    $savedsongid = -1;
+    $savedtransition = 0;
+    $savedplaylist = -1;
+    $pbcb = 0;
+    $playbutton->set_active(0);
+    $dboldupdate = 0;
+    $dbwait = 1;
+
+    # Reset the icon
+    $iconmode = 0;
+    IconExpose();
+
+    # Blank the music chooser
+    MC_RepopulateSel();
+    MC_Repopulate();
+
+    # Refresh preferences
+    InvalidatePrefs();
+}
+
+sub MPDConnect {
+    my ($interactive) = @_;
+    MPDReset();
     my $host = $argvhost || $ENV{MPD_HOST} || $config{Connection}{MPDHost} ||
       'localhost';
     my $port = $argvport || $ENV{MPD_PORT} || $config{Connection}{MPDPort} ||
       6600;
     my $pass = $argvpass || $config{Connection}{MPDPass} || '';
-    $pass = $1
-      if $host =~ s/^(.+)@// && !$argvpass && (!$pass || $ENV{MPD_HOST});
+    $pass = $1 if $host =~ s/^(.+)@// && !$argvpass &&
+      (!$pass || $ENV{MPD_HOST});
+
+    # Update the labels
+    $tip[1] = '';
+    $tip[2] = sprintf('Connecting to %s...',"$host:$port");
+    UpdateLabels();
 
     sub TryIt {
 	my ($host,$port,$pass) = @_;
 	$sock = IO::Socket::INET->new(PeerAddr => $host, PeerPort => $port);
 	if ( !$sock ) { ParseMPDError($!); return 0 }
+	push @rq, \&MPDResponseSimple;
 	$mpd{host} = $host;
 	$mpd{port} = $port;
-	MPDResponseSimple() or return 0;
 	if ( $pass ) {
 	    MPDSend('password', $pass);
-	    MPDResponseSimple();
-	    $mpd{password} = $pass;
+	    push @rq, \&MPDResponseSimple;
+	    $argvpass = $pass;
 	}
+	MC_RepopulateSel();    # Update playlist dropdown on reconnect
+	$iobuffer = '';
+	$iowatch = Glib::IO->add_watch(fileno($sock), 'in', \&MPDCallback);
 	return 1;
     }
     my $rc;
@@ -1119,292 +1291,217 @@ sub MPDConnect {
 	else { sleep $i }
     }
     $sock = undef unless $rc;
-    if ( $rc && !MPDUsable() ) { $sock = undef; $rc = 0 }
-    elsif ( !$rc && $_[0] ) {		# Interactive error
-	my $msg = sprintf("Cannot connect to MPD server %s:\n%s",
+    $connecttime = time;
+    if ( !$rc && $interactive ) {		# Interactive error
+	my $msg = sprintf("Cannot connect to %s\n%s",
 			  "$host:$port",$mpderror||'No error reported.');
-	my $dialog = Gtk2::MessageDialog
-	  ->new_with_markup(undef, 'modal','error', 'none',
-			    '<span weight="bold" size="large">'.
-			    'Error'."</span>\n\n$msg");
-	$dialog->add_button('gtk-preferences', 'accept');
-	$dialog->add_button('gtk-quit','reject');
-	$dialog->set_default_response('reject');
-
-	$dialog->set_title('Yocto');
-	my $rc = $dialog->run;
-	$dialog->destroy;
-	Prefs() if $rc eq 'accept';
+	Prefs(2,$msg);
     }
     return $sock ? 1 : 0;
 }
 
 sub MPDReconnect {
     return if $sock;
-    if ( $reconnectin <= 0 ) {
-	$tip[2] = 'Attempting to reconnect...'; UpdateLabels();
-	MPDConnect() or $reconnectin = 10;
-    }
-    else {
-	$tip[2] = "Reconnecting in $reconnectin seconds..."; UpdateLabels();
-	$reconnectin--;
-    }
+    $reconnectin--;
+    MPDConnect(0) if $reconnectin < 1;
+    return;
 }
 
 sub MPDError {
     # MPD has dropped the connection.
-    return unless $sock;
+    return 0 unless $sock;
     return MPDAuth() if $mpderror && ( $mpderrid == 3 || $mpderrid == 4 );
-    undef $sock;
-
-    # Reset the status
-    @tip = ('Disconnected from server',$mpderror,'','','Playlist');
-    UpdateLabels();
-    SetCover('');
-    $allowseek = 0;
-    SetTimebox($timebox);
-    $savedstate = 'error';
-    $savedsongid = -1;
-    $savedtransition = 0;
-    $savedplaylist = -1;
-    $pbcb = 0;
-    $playbutton->set_active(0);
-    %status = ();
-    %mpd = ();
-    %stats = ( db_update => 0 );
-    @playlist = ();
-    $dboldupdate = 0;
-    $dbwait = 1;
-
-    # Reset the icon
-    $iconfn = 'yocto-off.svg';
-    IconExpose();
-
-    # Blank the music chooser
-    MC_Repopulate();
-
-    # Refresh preferences
-    InvalidatePrefs();
 
     # Reconnect
     $reconnectin = 10;
+    MPDDisconnect();
     return 0;
 }
 
-sub MPDUsable {
-    MPDSend('status');
-    %status = MPDResponseInfo();
-    MPDAuth() unless $status{state};
-    $mpderror = undef;		     # Clear any authentication errors
-    $mpderrid = 0;
-    return $status{state} ? 1 : 0;
+sub MPDCallback {
+    unless ( sysread($sock, $iobuffer, 4096, length($iobuffer)) ) {
+	# Immediately retry if we have been connected for over a minute
+	return MPDConnect(0) if time-$connecttime > 60; # FIXME - D/Cing???
+	# Otherwise report an error
+	ParseMPDError($!||'Read error'); MPDError()
+    }
+    while ( $iobuffer =~ s/^(((?!OK)(?!ACK)[^\n]*\n)*?(OK|ACK)[^\n]*)\n//gs ) {
+	my @buf = split("\n",$1);
+	my $callback = shift @rq;
+	# TODO - Implement IDLE mode.
+	$callback = \&MPDResponseSimple unless $callback; # For alien replies
+	if ( $trace ) {
+	    my $f = (ref($callback) eq 'CODE')? $callback : $callback->[0];
+	    print $callbacknames{$f}||'(Unknown)',' ';
+	}
+	foreach my $x ( @buf ) {
+	    $x =~ s/[\r\n]//g;
+	    $x = decode('utf-8',$x);
+	    if ( $trace )
+	      { print '<'; print " $x\n" if $x =~ m/^OK|^ACK/ or $trace > 1 }
+	}
+	my $ref = ref($callback);
+	if ( $ref eq 'CODE' ) { &$callback(\@buf) }
+	elsif ( $ref eq 'ARRAY' ) {
+	    my @callback = @$callback;
+	    my $function = shift @callback;
+	    &$function(\@buf,@callback);
+	}
+	else { die "Unknown callback format $ref" }
+	if ( $mpderror ) {
+	    return unless MPDError(); # Abandon the connection unless true.
+	}
+    }
+    return 1;
 }
 
 sub MPDAuth {
-    return unless $sock && $mpderror && ( $mpderrid == 3 || $mpderrid == 4 );
-    # Authentication problem
-    $mpderror = undef;			# Clear the error
-    $mpderrid = 0;
+    return 0 unless $sock && $mpderror && ( $mpderrid == 3 || $mpderrid == 4 );
     my $hostspec = "$mpd{host}:$mpd{port}";
-    my $d = Gtk2::Dialog->new(sprintf('Enter password for %s',$hostspec),
-			      undef, 'modal', ());
-    $d->add_button('gtk-preferences', 'help') unless $icon;
-    $d->add_button($icon?'gtk-cancel':'gtk-quit','reject');
-    $d->add_button($icon?'gtk-ok':'gtk-connect', 'accept');
-    $d->set_default_response('accept');
-    $d->set_position('center');
-    $d->set_has_separator(0);
-    $d->set_resizable(0);
+    # Authentication problem
+    if ( 0 and  $status{state}||'' ) { ClearMPDError() }
+    else { MPDReset() } # Clear the error, disconnect
 
-    my $hbox = Gtk2::HBox->new();
-    $hbox->set_border_width(10);
-
-    my $a = Gtk2::Alignment->new(0.5,0,0,0);
-    $a->add(Gtk2::Image->new_from_stock('gtk-dialog-authentication','dialog'));
-    $hbox->pack_start($a,0,0,0);
-
-    my $vbox = Gtk2::VBox->new();
-
-    my $title = '<span weight="bold" size="large">' .
-      ($icon ? 'Access Denied' : 'Welcome to Yocto') . '</span>';
-    my $subtitle = sprintf("Please enter the MPD password for %s.", $hostspec);
-    my $l = Gtk2::Label->new("$title\n\n$subtitle\n");
-    $l->set_alignment(0,0.5);
-    $l->set_use_markup(1);
-    $vbox->pack_start($l,0,0,0);
-
-    my $passbox = Gtk2::HBox->new();
-    my $passlabel = Gtk2::Label->new('_Password:');
-    my $passentry = Gtk2::Entry->new();
-    $passlabel->set_use_underline(1);
-    $passlabel->set_mnemonic_widget($passentry);
-    $passentry->set_visibility(0);
-    $passentry->set_activates_default(1);
-    $passbox->pack_start($passlabel,0,0,0);
-    $passbox->pack_start($passentry,1,1,0);
-    $vbox->pack_start($passbox,0,0,0);
-
-    my $savecheck = Gtk2::CheckButton->new('_Remember this password');
-    $vbox->pack_start($savecheck,0,0,0);
-
-    $hbox->pack_start($vbox,1,1,0);
-    $d->vbox->add($hbox);
-    $d->show_all;
-    my $r = $d->run;
-    my $p = $passentry->get_text();
-    $d->destroy;
-
-    if ( $r eq 'accept' ) {
-	$argvpass = $p;
-	if ( $savecheck->get_active() )
-	  { $config{Connection}{MPDPass} = $argvpass; SaveConfig() }
-	return MPDConnect();
-    }
-    elsif ( $r eq 'help' ) { return Prefs() }
+    Prefs(3,sprintf("Access denied: Enter password for\n%s", $hostspec));
+    return $status{state}||'';
 }
 
-sub MPDPlay   { MPDSend('play',@_);   MPDResponseSimple(); MPDFuncRC() }
-sub MPDPause  { MPDSend('pause');     MPDResponseSimple(); MPDFuncRC() }
-sub MPDStop   { MPDSend('stop');      MPDResponseSimple(); MPDFuncRC() }
-sub MPDNext   { MPDSend('next');      MPDResponseSimple(); MPDFuncRC() }
-sub MPDPrev   { MPDSend('previous');  MPDResponseSimple(); MPDFuncRC() }
-sub MPDSeek   { MPDSend('seek',@_);   MPDResponseSimple(); MPDFuncRC() }
-sub MPDRandom { MPDSend('random',@_); MPDResponseSimple(); MPDFuncRC() }
-sub MPDRepeat { MPDSend('repeat',@_); MPDResponseSimple(); MPDFuncRC() }
-sub MPDClear  { MPDSend('clear');     MPDResponseSimple(); MPDFuncRC() }
-sub MPDAdd    { MPDSend('add',@_);    MPDResponseSimple(); MPDFuncRC() }
-sub MPDDelete { MPDSend('delete',@_); MPDResponseSimple(); MPDFuncRC() }
-sub MPDMove   { MPDSend('move',@_);   MPDResponseSimple(); MPDFuncRC() }
-sub MPDVolume { MPDSend('setvol',@_); MPDResponseSimple(); MPDFuncRC() }
-sub MPDXfade  { MPDSend('crossfade',@_); MPDResponseSimple(); MPDFuncRC() }
+sub MPDPlay      { MPDSend('play',@_);      push @rq, \&MPDResponseSimple }
+sub MPDPause     { MPDSend('pause');        push @rq, \&MPDResponseSimple }
+sub MPDStop      { MPDSend('stop');         push @rq, \&MPDResponseSimple }
+sub MPDNext      { MPDSend('next');         push @rq, \&MPDResponseSimple }
+sub MPDPrev      { MPDSend('previous');     push @rq, \&MPDResponseSimple }
+sub MPDSeek      { MPDSend('seek',@_);      push @rq, \&MPDResponseSimple }
+sub MPDRandom    { MPDSend('random',@_);    push @rq, \&MPDResponseSimple }
+sub MPDRepeat    { MPDSend('repeat',@_);    push @rq, \&MPDResponseSimple }
+sub MPDClear     { MPDSend('clear');        push @rq, \&MPDResponseSimple }
+sub MPDAdd       { MPDSend('add',@_);       push @rq, \&MPDResponseSimple }
+sub MPDDelete    { MPDSend('delete',@_);    push @rq, \&MPDResponseSimple }
+sub MPDMove      { MPDSend('move',@_);      push @rq, \&MPDResponseSimple }
+sub MPDVolume    { MPDSend('setvol',@_);    push @rq, \&MPDResponseSimple }
+sub MPDXfade     { MPDSend('crossfade',@_); push @rq, \&MPDResponseSimple }
 
-sub MPDStatus { MPDSend('status'); %status = MPDResponseInfo(); MPDFuncRC() }
-sub MPDStats  { MPDSend('stats');  %stats  = MPDResponseInfo(); MPDFuncRC() }
+sub MPDStatus    { MPDSend('status');       push @rq, \&MPDResponseStatus }
+sub MPDStats     { MPDSend('stats');        push @rq, \&MPDResponseStats }
+sub MPDUpdateDB  { MPDSend('update');       push @rq, \&MPDResponseSimple }
 
-sub MPDUpdateDB { MPDSend('update'); MPDResponseSimple(); MPDFuncRC() }
-
-sub MPDCurrentSong {
-    MPDSend('currentsong');
-    my %song = MPDResponseInfo();
-    MPDFuncRC();
-    return %song;
-}
-
-sub MPDPlaylistChanges {
-    MPDSend('plchanges',@_);
-    my @changes = MPDResponseSongList();
-    MPDFuncRC();
-    return @changes;
-}
+sub MPDPlChanges { MPDSend('plchanges',@_); push @rq, \&MPDResponsePlChanges }
 
 sub MPDSearch {
-    MPDSend('search',@_);
-    my @results = MPDResponseSongList();
-    MPDFuncRC();
-    return @results;
+    my ($type,$query,$callback,@args) = @_;
+    MPDSend('search',$type,$query);
+    push @rq, [$callback, @args];
 }
 
 sub MPDList {
-    MPDSend('lsinfo',@_);
-    my @list = MPDResponseRaw();
-    MPDFuncRC();
-    return @list;
+    my ($dir,$callback,@args) = @_;
+    MPDSend('lsinfo',$dir);
+    push @rq, [$callback, @args];
 }
 
 sub MPDListPlaylist {
-    MPDSend('listplaylistinfo',@_);
-    my @results = MPDResponseSongList();
-    MPDFuncRC();
-    return @results;
+    my ($pl,$callback,@args) = @_;
+    MPDSend('listplaylistinfo',$pl);
+    push @rq, [$callback, @args];
 }
 
-sub MPDPlMove { MPDSend('playlistmove',@_); MPDResponseSimple(); MPDFuncRC() }
-sub MPDPlDelete
-  { MPDSend('playlistdelete',@_); MPDResponseSimple(); MPDFuncRC() }
-sub MPDPlClear{ MPDSend('playlistclear',@_); MPDResponseSimple(); MPDFuncRC() }
-sub MPDPlAdd  { MPDSend('playlistadd',@_);   MPDResponseSimple(); MPDFuncRC() }
-sub MPDPlRemove { MPDSend('rm',@_); MPDResponseSimple(); MPDFuncRC() }
-sub MPDPlSave { MPDSend('save',@_); MPDResponseSimple();
-		if ( $mpderror && $mpderrid == 56 ) { return 0 } # No-Overwrite
-		MPDFuncRC() }
+sub MPDPlMove   { MPDSend('playlistmove',@_);   push @rq, \&MPDResponseSimple }
+sub MPDPlDelete { MPDSend('playlistdelete',@_); push @rq, \&MPDResponseSimple }
+sub MPDPlClear  { MPDSend('playlistclear',@_);  push @rq, \&MPDResponseSimple }
+sub MPDPlAdd    { MPDSend('playlistadd',@_);    push @rq, \&MPDResponseSimple }
+sub MPDPlRemove { MPDSend('rm',@_);             push @rq, \&MPDResponseSimple }
+sub MPDPlSave   { MPDSend('save',shift @_);push @rq, [\&MPDResponseMCSave,@_] }
 
-sub MPDOutputs {
-    MPDSend('outputs');
-    my @list = MPDResponseRaw();
-    MPDFuncRC();
-    return @list;
-}
+sub MPDOutputs { MPDSend('outputs'); push @rq, [\&MPDResponseOutputs, @_] }
 sub MPDEnableOutput
-  { MPDSend('enableoutput',@_); MPDResponseSimple(); MPDFuncRC() }
+  { MPDSend('enableoutput',@_);  push @rq, \&MPDResponseSimple }
 sub MPDDisableOutput
-  { MPDSend('disableoutput',@_); MPDResponseSimple(); MPDFuncRC() }
+  { MPDSend('disableoutput',@_); push @rq, \&MPDResponseSimple }
+
+sub MPDResponseStatus { %status = MPDResponseInfo(@_); UpdateStatus() }
+sub MPDResponseStats { %stats = MPDResponseInfo(@_); UpdateStats() }
+sub MPDResponsePlChanges { UpdatePlaylist(MPDResponseSongList(@_)) }
+sub MPDResponseOutputs {
+    my @list = MPDResponseRaw(shift @_);
+    my $func = shift @_;
+    &$func(\@list,@_);
+}
+sub MPDResponseMCSongList {
+    my @results = MPDResponseSongList(shift @_);
+    MC_RepopulateCallback(\@results, @_);
+}
+sub MPDResponseMCList {
+    my @results = MPDResponseRaw(shift @_);
+    MC_RepopulateSelCallback(\@results, @_);
+}
+sub MPDResponseMCSave {
+    my ($lines,$func) = @_;
+    MPDResponseSimple($lines);
+    my $rc = $mpderror && $mpderrid == 56;
+    ClearMPDError() if $rc; # No-Overwrite
+    &$func($rc ? 0 : 1);
+}
 
 sub MPDSend {
-    unless ( $sock ) { ParseMPDError('Not connected'); return 0 }
+    # FIXME - Remove old code
+    unless ( $sock ) { return 0; ParseMPDError('Not Connected'); return 0 }
     my @l = ();
     foreach ( @_ ) { my $x = (m/ / or $_ eq '')?('"'.$_.'"'):$_; push @l, $x }
     my $msg = join(' ', @l);
-    print "> $msg " if $trace;
+    print "> $msg\n" if $trace;
     unless ( print $sock encode('utf-8',$msg),"\n" )
       { ParseMPDError($!||'Write error'); return 0 }
     return 1;
 }
 
-sub MPDReadResponseLine {
-    unless ( $sock ) { ParseMPDError('Not connected'); return undef }
-    my $x = <$sock>;
-    if ( !defined($x) ) { ParseMPDError($!||'Read error'); return $x }
-    $x =~ s/[\r\n]//g;
-    $x = decode('utf-8',$x);
-    if ( $trace )
-      { print '<'; print " $x\n" if $x =~ m/^OK|^ACK/ or $trace > 1 }
-    return $x;
-}
-
 sub MPDResponseSimple {
-    while ( 1 ) {
-	my $l = MPDReadResponseLine(); if ( !defined($l) ) { return 0 }
+    my $lines = shift @_;
+    return unless ref($lines) eq 'ARRAY';
+    foreach my $l ( @$lines ) {
 	# Process response lines
-	if ( $l =~ m/^OK/ ) { $mpderror = undef; $mpderrid = 0; return 1 }
-	if ( $l =~ m/^ACK/ ) { ParseMPDError($l); return 0 }
+	if ( $l =~ m/^OK/ ) { ClearMPDError(); last }
+	if ( $l =~ m/^ACK/ ) { ParseMPDError($l); last }
     }
 }
 
 sub MPDResponseInfo {
     my %info = ();
-    my %decoy = ();
-    while ( 1 ) {
-	my $l = MPDReadResponseLine(); if ( !defined($l) ) { return %decoy }
+    my $lines = shift @_;
+    return unless ref($lines) eq 'ARRAY';
+    foreach my $l ( @$lines ) {
 	if ( $l =~ m/^(.+?)\s*:\s*(.+)$/ ) { $info{$1} = $2 }
-	if ( $l =~ m/^OK/ ) { $mpderror = undef; $mpderrid = 0; return %info }
-	if ( $l =~ m/^ACK/ ) { ParseMPDError($l); return %decoy }
+	if ( $l =~ m/^OK/ ) { ClearMPDError(); last }
+	if ( $l =~ m/^ACK/ ) { ParseMPDError($l); %info = (); last }
     }
+    return %info;
 }
 
 sub MPDResponseSongList {
     my @list = ();
-    my @decoy = ();
     my $info = {};
     my $n = 0;
-    while ( 1 ) {
-	my $l = MPDReadResponseLine(); if ( !defined($l) ) { return @decoy }
+    my $lines = shift @_;
+    return unless ref($lines) eq 'ARRAY';
+    foreach my $l ( @$lines ) {
 	if ( $l =~ m/^file\s*:/ ) { push @list, $info if $n++; $info = {} }
 	if ( $l =~ m/^(.+?)\s*:\s*(.+)$/ ) { $info->{$1} = $2 }
-	if ( $l =~ m/^OK/ ) { $mpderror = undef; $mpderrid = 0;
-			      push @list, $info if $n++; return @list }
-	if ( $l =~ m/^ACK/ ) { ParseMPDError($l); return @decoy }
+	if ( $l =~ m/^OK/ )
+	  { ClearMPDError(); push @list, $info if $n++; last }
+	if ( $l =~ m/^ACK/ ) { ParseMPDError($l); @list = (); last }
     }
+    return @list;
 }
 
 sub MPDResponseRaw {
     my @list = ();
-    my @decoy = ();
-    while ( 1 ) {
-	my $l = MPDReadResponseLine(); if ( !defined($l) ) { return @decoy }
+    my $lines = shift @_;
+    return unless ref($lines) eq 'ARRAY';
+    foreach my $l ( @$lines ) {
 	push @list, $l;
-	if ( $l =~ m/^OK/ ) { $mpderror = undef; $mpderrid = 0; return @list }
-	if ( $l =~ m/^ACK/ ) { ParseMPDError($l); return @decoy }
+	if ( $l =~ m/^OK/ ) { ClearMPDError(); last }
+	if ( $l =~ m/^ACK/ ) { ParseMPDError($l); @list = (); last }
     }
+    return @list;
 }
 
 sub ParseMPDError {
@@ -1414,19 +1511,25 @@ sub ParseMPDError {
     $mpderrid = $1||0;
 }
 
-sub MPDFuncRC { if ( $mpderror ) { MPDError(); return 0 } else { return 1 } }
+sub ClearMPDError {
+    $mpderror = undef;
+    $mpderrid = 0;
+}
 
 # Preferences
 
 sub Prefs {
+    my ($connectdlg, $connectmsg) = @_;
+    if ( $prefsdlg and $connectdlg ) { $prefsdlg->destroy; undef $prefsdlg }
     return $prefsdlg->present if $prefsdlg;
     my $dialog = $prefsdlg =
-      Gtk2::Dialog->new('Yocto Preferences',undef,'modal', ());
-    if ( $icon ) { $dialog->add_button('gtk-close', 'accept') }
-    else {
-	$dialog->add_button('gtk-quit','reject');
+      Gtk2::Dialog->new($connectdlg ? 'Yocto' : 'Yocto Preferences',
+			undef,'modal', ());
+    if ( $connectdlg ) {
+	$dialog->add_button('gtk-cancel','reject');
 	$dialog->add_button('gtk-connect', 'accept');
     }
+    else { $dialog->add_button('gtk-close', 'accept') }
     $dialog->set_default_response('accept');
     $dialog->set_position('center');
     $dialog->set_has_separator(0);
@@ -1442,7 +1545,7 @@ sub Prefs {
     $general->pack_start($tracknotify,0,0,0);
 
     my $showcovers = Gtk2::CheckButton->new("Display album _covers");
-    $showcovers->set_active($config{Settings}{TrackNotify} ? 1 : 0);
+    $showcovers->set_active($config{Settings}{ShowCovers} ? 1 : 0);
     $showcovers->signal_connect('toggled',sub { $config{Settings}{ShowCovers} = $_[0]->get_active() ? 1 : 0 ; $savedstate = ''; 0 });
     $general->pack_start($showcovers,0,0,0);
     my $coversnote = Gtk2::Label->new('<small>Music Location is used to find cover images.</small>');
@@ -1451,6 +1554,18 @@ sub Prefs {
     $general->pack_start($coversnote,0,0,0);
 
     my $server = Gtk2::VBox->new();
+    my $padserverbox = 0;
+    if ( ( $connectdlg == 2 or $connectdlg == 3) && $connectmsg ) {
+	my $alertbox = Gtk2::HBox->new();
+	my $icon = $connectdlg == 3 ?
+	  'gtk-dialog-authentication' : 'gtk-dialog-error';
+	my $alerticon = Gtk2::Image->new_from_stock($icon,'dnd');
+	my $alert = Gtk2::Label->new($_[1]);
+	$alertbox->pack_start($alerticon,0,0,0);
+	$alertbox->pack_start($alert,0,0,0);
+	$server->pack_start($alertbox,0,0,0);
+	$padserverbox = 8;
+    }
     if ( $argvport or $ENV{MPD_PORT} or $argvhost or $ENV{MPD_HOST} ) {
 	my $alertbox = Gtk2::HBox->new();
 	my $alerticon = Gtk2::Image->new_from_stock('gtk-dialog-warning','dnd');
@@ -1458,15 +1573,18 @@ sub Prefs {
 	$alertbox->pack_start($alerticon,0,0,0);
 	$alertbox->pack_start($alert,0,0,0);
 	$server->pack_start($alertbox,0,0,0);
+	$padserverbox = 8;
     }
 
-    my $serhbox = Gtk2::HBox->new();
-    my $serlvbox = Gtk2::VBox->new();
-    my $serevbox = Gtk2::VBox->new();
-    $serhbox->pack_start($serlvbox,0,0,0);
-    $serhbox->pack_start($serevbox,1,1,0);
+    if ( $padserverbox ) {
+	my $a = Gtk2::Alignment->new(0,0,0,0);
+	$a->set_padding($padserverbox,0,0,0);
+	$server->pack_start($a,0,0,0);
+    }
+    my $servertable = Gtk2::Table->new(6,2);
 
     my $hostentry = Gtk2::Entry->new();
+    $hostentry->set_activates_default(1);
     $hostentry->set_text($config{Connection}{MPDHost});
     my $hostlabel = Gtk2::Label->new('_Host: ');
     ($hostlabel->set_sensitive(0),$hostentry->set_sensitive(0))
@@ -1474,10 +1592,12 @@ sub Prefs {
     $hostlabel->set_use_underline(1);
     $hostlabel->set_mnemonic_widget($hostentry);
     $hostlabel->set_alignment(0,0.5);
-    $serevbox->add($hostentry);
-    $serlvbox->add($hostlabel);
+    $servertable->attach($hostlabel,0,1,0,1,'fill','fill',0,0);
+    $servertable->attach($hostentry,1,2,0,1,['expand','fill'],'fill',0,0);
+    $hostentry->grab_focus() if $connectdlg == 2;
 
     my $portentry = Gtk2::Entry->new();
+    $portentry->set_activates_default(1);
     $portentry->set_text($config{Connection}{MPDPort});
     my $portlabel = Gtk2::Label->new('_Port: ');
     ($portlabel->set_sensitive(0),$portentry->set_sensitive(0))
@@ -1485,54 +1605,54 @@ sub Prefs {
     $portlabel->set_use_underline(1);
     $portlabel->set_mnemonic_widget($portentry);
     $portlabel->set_alignment(0,0.5);
-    $serevbox->add($portentry);
-    $serlvbox->add($portlabel);
-
-    $server->pack_start($serhbox,0,0,0);
+    $servertable->attach($portlabel,0,1,1,2,'fill','fill',0,0);
+    $servertable->attach($portentry,1,2,1,2,['expand','fill'],'fill',0,0);
 
     my $sernotice = Gtk2::Label->new('<small>The default host is localhost, the default port is 6600.</small>');
     $sernotice->set_alignment(0,0);
     $sernotice->set_use_markup(1);
     $sernotice->set_line_wrap(1);
-    $server->add($sernotice);
-
-    my $passlabel = Gtk2::Label->new('Saved Password: ');
-    $passlabel->set_alignment(0,0.5);
-    #$serlvbox->add($passlabel);
-    my $passhbox = Gtk2::HBox->new();
-    my $passbutton = Gtk2::Button->new_from_stock('gtk-clear');
-    $passbutton->set_sensitive($config{Connection}{MPDPass} ? 1 : 0);
-    $passbutton->signal_connect
-      ('clicked', sub { $config{Connection}{MPDPass} = '';
-			$mpd{password} = '' if exists($mpd{password});
-			SaveConfig(); $_[0]->set_sensitive(0); } );
-    #$serevbox->add(Gtk2::Button->new_from_stock('gtk-clear'));
-    $passhbox->pack_start($passlabel,1,1,0);
-    $passhbox->pack_start($passbutton,0,0,0);
-    $server->pack_start($passhbox,0,0,0);
+    $servertable->attach($sernotice,0,2,2,3,['expand','fill'],'fill',0,0);
 
     my $autostart = Gtk2::CheckButton->new("Try _starting MPD if connection fails");
     $autostart->set_active($config{Connection}{AutoStart} ? 1 : 0);
     $autostart->signal_connect('toggled',sub { $config{Connection}{AutoStart} = $_[0]->get_active() ? 1 : 0 ; 0 });
-    $server->pack_start($autostart,0,0,0);
+    $servertable->attach($autostart,0,2,3,4,['expand','fill'],'fill',0,0);
+
+    $servertable->set_row_spacing(3,8);
+
+    my $passentry = Gtk2::Entry->new();
+    $passentry->set_activates_default(1);
+    $passentry->set_visibility(0);
+    $passentry->set_text($config{Connection}{MPDPass});
+    my $passlabel = Gtk2::Label->new('P_assword: ');
+    $passlabel->set_use_underline(1);
+    $passlabel->set_mnemonic_widget($passentry);
+    $passlabel->set_alignment(0,0.5);
+    $servertable->attach($passlabel,0,1,4,5,'fill','fill',0,0);
+    $servertable->attach($passentry,1,2,4,5,['expand','fill'],'fill',0,0);
+    $passentry->grab_focus() if $connectdlg == 3;
+
+    my $savecheck = Gtk2::CheckButton->new('_Remember this password');
+    $savecheck->set_active($config{Connection}{MPDPass} ? 1 : 0);
+    $servertable->attach($savecheck,1,2,5,6,['expand','fill'],'fill',0,0);
+
+    $servertable->set_col_spacing(0,5);
+    $server->pack_start($servertable,0,0,0);
 
     my $dirhbox = Gtk2::HBox->new();
     my $direntry = Gtk2::Entry->new();
-    $direntry->set_text($config{External}{MusicDirectory}||$ENV{HOME});
+    $direntry->set_text($config{External}{MusicDirectory});
     #$direntry->set_alignment(0,0.5);
 
     my $dirbutton = Gtk2::Button->new();
-    #my $dirbhbox = Gtk2::HBox->new();
-    #$dirbhbox->pack_start($direntry,1,1,0);
-    #$dirbhbox->pack_start(Gtk2::VSeparator->new(),0,0,0);
-    #$dirbhbox->pack_start(Gtk2::Image->new_from_stock('gtk-open','menu'),0,0,0);
     $dirbutton->add(Gtk2::Image->new_from_stock('gtk-open','menu'));
     $dirbutton->signal_connect
       ('clicked',
        sub {
 	   my $dirselect = Gtk2::FileChooserDialog->new('Select Music Location',$dialog,'select-folder',('gtk-cancel','reject','gtk-open','accept'));
 	   $dirselect->set_local_only(1);
-	   $dirselect->set_filename($direntry->get_text());
+	   $dirselect->set_filename($direntry->get_text()||$ENV{HOME}||'');
 	   my $r = $dirselect->run();
 	   $direntry->set_text($dirselect->get_filename()) if $r eq 'accept';
 	   $dirselect->destroy();
@@ -1544,7 +1664,7 @@ sub Prefs {
     $dirhbox->pack_start($dirlabel,0,0,0);
     $dirhbox->pack_start($direntry,1,1,0);
     $dirhbox->pack_start($dirbutton,0,0,0);
-    $server->pack_start($dirhbox,0,0,0) if $icon;
+    $server->pack_start($dirhbox,0,0,0) unless $connectdlg;
 
     my $audio = Gtk2::VBox->new();
 
@@ -1632,21 +1752,26 @@ sub Prefs {
     $outputsw->set_size_request(1,100);
     $audio->pack_start($outputsw,1,1,0);
     $outputs_populated = 0;
-    $outputs->signal_connect('expose-event',\&PopulateOutputs,
+    $outputs->signal_connect('expose-event',\&ExposeOutputs,
 			    [$outputmodel,$outlabel,$outputsw]);
     $outlabel->set_sensitive(0);
     $outputsw->set_sensitive(0);
 
-    sub PopulateOutputs {
+    sub ExposeOutputs {
 	my ($outputs,$event,$args) = @_;
-	my ($outputmodel,$outlabel,$outputsw) = @$args;
 	return 0 if $outputs_populated;
+	return PopulateOutputs(undef, @$args) unless $sock;
+	MPDOutputs(\&PopulateOutputs, @$args);
+    }
+    sub PopulateOutputs {
+	my ($outputs,$outputmodel,$outlabel,$outputsw) = @_;
 	$outputmodel->clear();
 	$outlabel->set_sensitive(0);
 	$outputsw->set_sensitive(0);
-	my @outputs = MPDOutputs();
+	return 0 unless $outputs and @$outputs;
+	$outputs_populated = 1;
 	my %output = ();
-	foreach ( @outputs, 'outputid:' ) {
+	foreach ( @$outputs, 'outputid:' ) {
 	    if ( m/^outputid:/ && %output ) {
 		$outputmodel->insert_with_values(-1,0,$output{outputid},
 						 1,$output{outputenabled}?1:0,
@@ -1657,7 +1782,6 @@ sub Prefs {
 	}
 	$outlabel->set_sensitive(1);
 	$outputsw->set_sensitive(1);
-	$outputs_populated = 1;
 	return 0;
     }
     sub OutputToggled {
@@ -1672,12 +1796,8 @@ sub Prefs {
     }
 
     my $library = Gtk2::VBox->new();
-    my $statlabel = Gtk2::Label->new('Library statistics:');
-    $statlabel->set_alignment(0,0.5);
-    $library->pack_start($statlabel,0,0,0);
-
     @prefs_stats = ();
-    foreach (0..3) {
+    foreach (0..4) {
 	my $l = Gtk2::Label->new($prefs_stats_l[$_]);
 	$l->set_alignment(0,0.5);
 	$library->pack_start($l,0,0,0);
@@ -1711,7 +1831,20 @@ sub Prefs {
     $advanced->pack_start($mpdcmdlabel,0,0,0);
     $advanced->pack_start($mpdcmdentry,0,0,0);
 
-    if ( $icon ) {
+    if ( $connectdlg ) {
+	my $serbox = Gtk2::VBox->new();
+	my $serlabel = Gtk2::Label->new('<big><b>Welcome to Yocto</b></big>');
+	$serlabel->set_use_markup(1);
+	$serlabel->set_alignment(0,0);
+	$serbox->add($serlabel);
+	my $seralign = Gtk2::Alignment->new(0.5,0.5,1,1);
+	#$seralign->set_padding(0,0,12,0);
+	$seralign->add($server);
+	$serbox->add($seralign);
+	$serbox->set_border_width(10);
+	$dialog->vbox->pack_start($serbox,0,0,0);
+    }
+    else {
 	$general->set_border_width(10);
 	$notebook->append_page($general,Gtk2::Label->new('General'));
 
@@ -1732,50 +1865,39 @@ sub Prefs {
 	$nbvbox->add($notebook);
 	$dialog->vbox->add($nbvbox);
     }
-    else {
-	my $serbox = Gtk2::VBox->new();
-	my $serlabel = Gtk2::Label->new('<big><b>Welcome to Yocto</b></big>');
-	$serlabel->set_use_markup(1);
-	$serlabel->set_alignment(0,0);
-	$serbox->add($serlabel);
-	my $seralign = Gtk2::Alignment->new(0.5,0.5,1,1);
-	#$seralign->set_padding(0,0,12,0);
-	$seralign->add($server);
-	$serbox->add($seralign);
-	$serbox->set_border_width(10);
-	$dialog->vbox->pack_start($serbox,0,0,0);
-    }
     $dialog->show_all;
-    my $r = $dialog->run;
+    $dialog->signal_connect
+      ('response', sub {
+	   my ($dialog,$r) = @_;
+	   $prefsdlg = undef;
+	   @prefs_stats = ();
 
-    $prefsdlg = undef;
-    @prefs_stats = ();
-
-    $config{External}{RefillCommand} = $refillentry->get_text();
-    $config{External}{MPDCommand} = $mpdcmdentry->get_text();
-    my $newhost = $hostentry->get_text();
-    my $newport = $portentry->get_text();
-    my $newdir = $direntry->get_text();#$dirselect->get_filename();
-    $dialog->destroy;
-    if ( $newdir ne $config{External}{MusicDirectory} ) {
-	$config{External}{MusicDirectory} = $newdir;
-	$savedstate = '';
-    }
-    if ( $newhost ne $config{Connection}{MPDHost} or
-	 $newport ne $config{Connection}{MPDPort} or
-	 ( !$icon and $r eq 'accept' ) ) {
-	$config{Connection}{MPDHost} = $newhost;
-	$config{Connection}{MPDPort} = $newport;
-	SaveConfig();			# Save preferences
-	if ( $icon ) {
-	    my $dialog = Gtk2::MessageDialog->new_with_markup(undef, 'modal', 'info',
-							      'close', '<span weight="bold" size="large">Settings Changed</span>'."\n\n".'Yocto must be restarted for some of your changes to take effect.');
-	    $dialog->run;
-	    $dialog->destroy;
-	}
-	else { MPDConnect(1) }
-    }
-    elsif ( $r eq 'accept' ) { SaveConfig() } # Save preferences
+	   $config{External}{RefillCommand} = $refillentry->get_text();
+	   $config{External}{MPDCommand} = $mpdcmdentry->get_text();
+	   my $newhost = $hostentry->get_text();
+	   my $newport = $portentry->get_text();
+	   my $newpass = $passentry->get_text();
+	   my $newdir = $direntry->get_text();#$dirselect->get_filename();
+	   $dialog->destroy;
+	   if ( $newdir ne $config{External}{MusicDirectory} ) {
+	       $config{External}{MusicDirectory} = $newdir;
+	       $savedstate = '';
+	   }
+	   if ( $newhost ne $config{Connection}{MPDHost} or
+		$newport ne $config{Connection}{MPDPort} or
+		$newpass ne $config{Connection}{MPDPass} or
+		(!$savecheck->get_active() && $config{Connection}{MPDPass}) or
+		( $connectdlg and $r eq 'accept' ) ) {
+	       $config{Connection}{MPDHost} = $newhost;
+	       $config{Connection}{MPDPort} = $newport;
+	       $config{Connection}{MPDPass} = $savecheck->get_active() ?
+		 $newpass : '';
+	       $argvpass = $newpass;
+	       SaveConfig();			# Save preferences
+	       MPDConnect(1);
+	   }
+	   elsif ( $r eq 'accept' ) { SaveConfig() } # Save preferences
+       });
 }
 
 sub InvalidatePrefs {
@@ -1812,7 +1934,7 @@ sub MC_Show {
 	$mcsearch->set_activates_default(0);
 	$mcsearch->signal_connect('activate', sub { $mcquery = $mcsearch->get_text(); $mcsel->set_active(-1); $mcsel->set_active(1); });
 	$topbox->pack_end($mcsearch,0,0,0);
-	my $mcsearchlabel = Gtk2::Label->new('   Search _Library: ');
+	$mcsearchlabel = Gtk2::Label->new('   Search _Library: ');
 	$mcsearchlabel->set_use_underline(1);
 	$mcsearchlabel->set_mnemonic_widget($mcsearch);
 	$topbox->pack_end($mcsearchlabel,0,0,0);
@@ -1867,34 +1989,42 @@ sub MC_Repopulate {			# Repopulate the main view
     $mcreorder = 1;
     $mctreemodel->clear();
     $mctree->set_reorderable(0);
-    return $mcscrollnext = 1 if $mcsel->get_active() < 0 or !$sock;
+    $mcreorder = 0;
+    return $mcscrollnext = 1 if $mcsel->get_active() < 0;
     my $iter = $mcsel->get_active_iter();
     my $path = $mcselmodel->get($iter,0);
     my ($type,$arg) = ($mctype,$mcarg) = split ':', $path;
-    my @list = ();
-    my $scrollto = 0;
     if ( $type eq 'np' ) {
-	@list = @playlist;
-	$scrollto = $status{song};
 	$mcwnd->set_title('Now Playing');
 	$mctree->set_reorderable(1);
+	return MC_RepopulateCallback(\@playlist, $type);
     }
     elsif ( $type eq 'sr' ) {
-	@list = MPDSearch('any',$mcquery||'') if length($mcquery||'') >= 3;
-	no warnings;
+	$mcwnd->set_title('Search Results');
+	if ( length($mcquery||'') >= 3 )
+	  { MPDSearch('any', $mcquery||'', \&MPDResponseMCSongList, $type) }
+	else { my @list = (); MC_RepopulateCallback(\@list, $type) }
+    }
+    elsif ( $type eq 'pl' ) {
+	$mcwnd->set_title($arg);
+	$mctree->set_reorderable(1);
+	MPDListPlaylist($arg, \&MPDResponseMCSongList, $type);
+    }
+    else { return }
+}
+sub MC_RepopulateCallback {
+    my @list = @{shift @_};
+    my ($type) = @_;
+    my $scrollto = 0;
+    my $i = 0;
+    $mcreorder = 1;
+    if ( $type eq 'np' ) { $scrollto = $status{song} }
+    if ( $type eq 'sr' ) {
+    	no warnings;
 	@list = sort { ($a->{Album}||'') cmp ($b->{Album}||'')
 			 || ($a->{Track}||0) <=> ($b->{Track}||0) } @list
 			   if $list[0];
-	$mcwnd->set_title('Search Results');
     }
-    elsif ( $type eq 'pl' ) {
-	@list = MPDListPlaylist($arg);
-	$mcwnd->set_title($arg);
-	$mctree->set_reorderable(1);
-    }
-    else { return }
-
-    my $i = 0;
     foreach ( @list ) {
 	last unless $_;
 	my %song = %$_;
@@ -1976,21 +2106,33 @@ sub MC_Repopulate {			# Repopulate the main view
 	$mcbutbox->pack_end($tmpbut,0,0,0);
 	$tmpbut->signal_connect('clicked',\&MC_RemSel);
     }
+
+    # Disable controls if disconnected
+    $_->set_sensitive($sock ? 1 : 0) foreach $mcsel, $mcsearch, $mcsearchlabel;
+    $mcbutbox->foreach(sub { $_[0]->set_sensitive(0) }) unless $sock;
+
     $mcbutbox->show_all;
     $mcreorder = 0;
 }
 
 sub MC_RepopulateSel {			# Repopulate the drop down
     return unless $mcvisible;
+    return MC_RepopulateSelCallback() unless $sock;
+    MPDList('',\&MPDResponseMCList);
+}
+sub MC_RepopulateSelCallback {
     $mcselmodel->clear();
     $mcselmodel->insert_with_values(-1,0,'np:',1,'Now Playing');
     $mcselmodel->insert_with_values(-1,0,'sr:',1,'Search Results');
     $mcselmodel->insert_with_values(-1,0,':');
-    my @results = MPDList();
-    foreach ( @results ) {
-	next unless s/^playlist: //; # Why can't I use an m/ here??
-	$mcselmodel->insert_with_values(-1,0,'pl:'.$_,1,$_);
+    $mcsel->set_active(0);
+    return unless $_[0];
+    my @pls = ();
+    foreach ( sort @{$_[0]} ) {
+	push @pls, $_ if s/^playlist: //; # Why can't I use an m/ here??
     }
+    $mcselmodel->insert_with_values(-1,0,'pl:'.$_,1,$_) foreach sort @pls;
+
 }
 
 sub MC_AddAll {
@@ -2098,29 +2240,38 @@ sub MC_Save {
     $hbox->pack_end($entry,1,1,0);
     $hbox->set_border_width(10);
     $dialog->vbox->add($hbox);
-
+    $dialog->signal_connect('response', sub {
+				my ($dialog,$response) = @_;
+				return $dialog->destroy()
+				  unless $response eq 'accept';
+				my $v = $entry->get_text();
+				return 0 if !length($v) or $v =~ m/\//;
+				MPDPlSave($v, sub {
+					      my ($rc) = @_;
+					      if ( $rc ) {
+						  $dialog->destroy();
+						  MC_RepopulateSel();
+						  $mcsel->set_active(0);
+						  return;
+					      }
+					      OverwriteError($dialog,$v);
+					  });
+				return 0;
+			    });
     $dialog->show_all;
-    my $v = '';
-    while ( 1 ) {
-	my $rc = $dialog->run;
-	last if $rc ne 'accept';
-	my $v = $entry->get_text();
-	next if !length($v) or $v =~ m/\//;
-	my $sr = MPDPlSave($v);
-	last if $sr;
+    $dialog->run;
+    sub OverwriteError {
+	my ($dialog,$v) = @_;
 	my $confirm = Gtk2::MessageDialog
 	  ->new_with_markup($dialog, 'modal','error', 'none',
-			'<span weight="bold" size="large">'.
-			sprintf('There is already a playlist named "%s".',$v)
-			."</span>\n\n".
-			'A playlist with this name already exists.');
+			    '<span weight="bold" size="large">'.
+			    sprintf('There is already a playlist named "%s".',
+				    $v)."</span>\n\n".
+			    'A playlist with this name already exists.');
 	$confirm->add_button('gtk-ok','reject');
 	$confirm->run;
 	$confirm->destroy;
     }
-    $dialog->destroy;
-    MC_RepopulateSel();
-    $mcsel->set_active(0);
 }
 
 1;

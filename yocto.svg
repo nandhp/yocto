@@ -6,7 +6,6 @@
    xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
    xmlns:svg="http://www.w3.org/2000/svg"
    xmlns="http://www.w3.org/2000/svg"
-   xmlns:xlink="http://www.w3.org/1999/xlink"
    xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
    xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
    width="22"
@@ -26,7 +25,7 @@
        inkscape:vp_y="0 : 1000 : 0"
        inkscape:vp_z="22 : 11 : 1"
        inkscape:persp3d-origin="11 : 7.3333333 : 1"
-       id="perspective12" />
+       id="perspective8" />
   </defs>
   <sodipodi:namedview
      id="base"
@@ -38,16 +37,16 @@
      objecttolerance="10"
      inkscape:pageopacity="0.0"
      inkscape:pageshadow="2"
-     inkscape:zoom="15.6875"
-     inkscape:cx="12.908367"
-     inkscape:cy="-1.0453927"
+     inkscape:zoom="34.246244"
+     inkscape:cx="10.783291"
+     inkscape:cy="11"
      inkscape:document-units="px"
-     inkscape:current-layer="layer1"
+     inkscape:current-layer="svg2"
      width="22px"
      height="22px"
-     inkscape:window-width="987"
-     inkscape:window-height="971"
-     inkscape:window-x="50"
+     inkscape:window-width="1680"
+     inkscape:window-height="975"
+     inkscape:window-x="0"
      inkscape:window-y="25"
      showgrid="false" />
   <metadata
@@ -84,36 +83,9 @@ Yocto logo
      inkscape:label="Layer 1"
      inkscape:groupmode="layer"
      id="layer1">
-    <g
-       id="g3143"
-       transform="matrix(0.4725884,0,0,0.4725884,0.4104041,-0.7321607)">
-      <path
-         transform="translate(-5.5294118,3.0588235)"
-         d="M 19.882353,37.588234 A 5.9411764,5.9411764 0 1 1 8,37.588234 A 5.9411764,5.9411764 0 1 1 19.882353,37.588234 z"
-         sodipodi:ry="5.9411764"
-         sodipodi:rx="5.9411764"
-         sodipodi:cy="37.588234"
-         sodipodi:cx="13.941176"
-         id="path2168"
-         style="opacity:1;fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0;stroke-linecap:square;stroke-linejoin:miter;stroke-miterlimit:4;stroke-dasharray:none;stroke-dashoffset:0;stroke-opacity:1"
-         sodipodi:type="arc" />
-      <path
-         id="path2170"
-         d="M 13.429715,40.783721 L 13.429715,11.724897"
-         style="fill:#000000;fill-opacity:1;fill-rule:evenodd;stroke:#000000;stroke-width:1.79999995;stroke-linecap:butt;stroke-linejoin:miter;stroke-miterlimit:4;stroke-dasharray:none;stroke-opacity:1" />
-    </g>
-    <use
-       x="0"
-       y="0"
-       xlink:href="#g3143"
-       id="use3147"
-       transform="translate(12.809696,-2.7413896)"
-       width="48"
-       height="48" />
     <path
-       style="fill:#000000;fill-opacity:1;fill-rule:evenodd;stroke:#000000;stroke-width:0;stroke-linecap:butt;stroke-linejoin:miter;stroke-miterlimit:4;stroke-dasharray:none;stroke-opacity:1"
-       d="M 6.3445404,4.8409941 L 19.998261,0.3824702 L 19.998261,2.6418571 L 6.3398966,6.9767523 L 6.3445404,4.8409941 z"
-       id="path3153"
-       sodipodi:nodetypes="ccccc" />
+       style="fill:#000000;fill-opacity:1;stroke:#bebebe;stroke-width:0.2;stroke-linecap:square;stroke-linejoin:miter;stroke-miterlimit:4;stroke-dasharray:none;stroke-dashoffset:0;stroke-opacity:0.49803922"
+       d="M 19.90324,0.25209523 C 15.400734,1.7819476 10.888999,3.2823137 6.3864925,4.812166 C 6.3955844,8.804472 6.3877502,12.797715 6.3903577,16.790381 C 5.1610635,15.423294 2.7211963,15.828339 1.9570363,17.524369 C 1.1300947,19.115591 2.1057907,21.334937 3.8313154,21.677272 C 5.4967263,22.093477 7.3413606,20.610775 7.2127033,18.794911 C 7.2417444,14.787785 7.2166678,10.778935 7.2252498,6.7710697 C 11.172949,5.4758381 15.12065,4.180607 19.068349,2.8853755 C 19.068349,6.5783906 19.068349,10.271406 19.068349,13.964422 C 17.755588,12.54369 15.158025,13.12167 14.523759,14.983245 C 13.844493,16.647442 15.031653,18.75328 16.781787,18.901616 C 18.417923,19.132739 20.092715,17.604934 19.891795,15.855865 C 19.920801,10.654655 19.893659,5.453344 19.90324,0.25209523 z"
+       id="path2168" />
   </g>
 </svg>

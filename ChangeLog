@@ -1,4 +1,8 @@
 CURRENT
+	- Use asynchronous communication with MPD
+	- Update icon to make it marginally more visible on dark backgrounds,
+	  and use (experimental) runtime icon editing to set color to system
+	  foreground and set alpha to avoid having a separate "paused" icon
 	- Offer a tooltip when song information is too long to display
 	- Provide better support for multimedia keys using Net::DBus
 	  (Closes #336734)
