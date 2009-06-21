@@ -54,7 +54,7 @@ install: all
 	install -p -m 644 yocto.svg $(pixmapdir)
 
 	install -d $(datadir)
-	install -p -m 644 yocto.svg yocto-off.svg $(datadir)
+	install -p -m 644 yocto.svg $(datadir)
 
 dist: distclean
 	rm -rf yocto-$(VERSION)

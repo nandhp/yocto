@@ -6,6 +6,5 @@ Makefile
 MANIFEST
 yocto
 yocto.desktop
-yocto-off.svg
 yocto.pod
 yocto.svg
