@@ -28,7 +28,7 @@ use IO::Socket::INET;
 use warnings;
 use strict;
 
-my $VERSION = 0.52;
+my $VERSION = 0.55;
 
 # Load "compilation" settings from footer (datadir). Also load text
 # strings from header comments (name, description, copyright, license)
