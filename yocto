@@ -21,7 +21,9 @@
 use Encode qw/encode decode/;
 use Gtk2;
 use Gtk2::TrayIcon;
-use File::Basename;
+use File::Basename;			# Replace with File::Spec?
+use File::Spec::Functions qw/:ALL/;
+use File::Path;
 use FindBin;
 use Getopt::Long;
 use IO::Socket::INET;
@@ -34,7 +36,7 @@ my $VERSION = 0.55;
 # strings from header comments (name, description, copyright, license)
 my $datadir = <DATA>;
 if ( $datadir && $datadir =~ m/^datadir=(.+?)\s+$/ ) { $datadir = $1 }
-else { $datadir = '.' }
+else { $datadir = File::Spec->curdir() }
 seek(DATA,0,0);				# Jump to the top of the file
 my ($progname,$tagline,$copyright,$license) = (undef,undef,undef);
 while (<DATA>) {
@@ -93,11 +95,16 @@ Gtk2::Window->set_default_icon_list
    Gtk2::Gdk::Pixbuf->new_from_file_at_size($iconfile,128,128));
 my $tipobj = Gtk2::Tooltips->new;	# Tooltips widget
 
+# Lookup XDG Music directory
+my $xdghome = Glib::get_home_dir()||'';
+my $xdgmusic = (eval {Glib::get_user_special_dir('music')})||$xdghome;
 # Load the configuration file
-my $configfile = "$ENV{HOME}/.yocto";
+my $configdir = catdir(Glib::get_user_config_dir(),'yocto');
+my $configfile = catfile($configdir,'config');
 my %config;
 my %configcomments = ();
 LoadConfig();			   # Load default configuration
+MigrateConfig(catfile($ENV{HOME},'.yocto')) if $ENV{HOME};
 LoadConfig($configfile);	   # Load user configuration
 SaveConfig();			   # Save changes (e.g. from upgrades)
 
@@ -247,7 +254,7 @@ sub findINC { # Locate a file by searching in some popular locations
 	return $file if (-e $file);
 	return undef;
     }
-    foreach my $dir ($datadir,$FindBin::Bin,@INC,split(':', $ENV{PATH}),'.','/usr/local/share','/usr/share','/usr/share/pixmaps','/usr/local/share/pixmaps','/usr/share/yocto','/usr/local/share/yocto')
+    foreach my $dir ($datadir,$FindBin::Bin,@INC,path(),'.','/usr/local/share','/usr/share','/usr/share/pixmaps','/usr/local/share/pixmaps','/usr/share/yocto','/usr/local/share/yocto')
     {
 	my $f = "$dir/$file";
 	return $f if -e $f;
@@ -452,11 +459,12 @@ sub MakeTooltip {
 	}
 	elsif ( !$song{file} || $status{state} eq 'stop' ) { SetCover('') }
 	else {
-	    my $d = $config{External}{MusicDirectory}.'/'.dirname($song{file});
+	    my $d = catdir($config{External}{MusicDirectory},
+			   dirname($song{file}));
 	    opendir DIR, $d;
 	    my @f = sort grep { PickCover($d,$_) } readdir DIR;
 	    closedir DIR;
-	    if ( @f == 1 || @f ) { SetCover("$d/$f[0]") } # Ambiguous too
+	    if ( @f == 1 || @f ) { SetCover(catfile($d,$f[0])) }# Ambiguous too
 	    elsif ( @f == 0 ) { SetCover('') }
 	}
     }
@@ -842,12 +850,13 @@ sub IconAllocate {
     my ($wx,$alloc) = @_;
     my ($oldsize) = $icon->get_size_request();
     my ($w,$h) = ($alloc->width,$alloc->height);
-    if ( $w != $h ) {
-	my $size = $w > $h ? $w : $h;
-	if ( $h == $oldsize ) { $size = $w }
-	if ( $w == $oldsize ) { $size = $h }
-	$icon->set_size_request($size,$size);
-    }
+    #print "A $w $h\n";
+    #if ( 1 ) {
+    my $size = $w > $h ? $w : $h;
+    if ( $h == $oldsize ) { $size = $w }
+    if ( $w == $oldsize ) { $size = $h }
+    $icon->set_size_request($size,$size) if $size != $oldsize;
+    #}
 }
 
 sub ButtonEvent {
@@ -1090,7 +1099,7 @@ ShowCovers=1
 
 [External]
 # Set this to MPD's music_directory
-MusicDirectory=
+MusicDirectory=$xdgmusic
 # Runs whenever the last track is selected
 RefillCommand=
 # Command to start MPD if AutoStart is on
@@ -1136,6 +1145,13 @@ sub LoadConfig {
 	elsif ( !$configfile and $l =~ m/^\s*#\s*(.*?)\s*$/ ) { $comment = $1 }
     }
     close F;
+}
+
+sub MigrateConfig {
+    # Load old configuration file if new file does not exist. If the
+    # new file was created successfully, delete the old one.
+    my ($old) = @_; if ( -e $old && !-e $configfile )
+      { LoadConfig($old); SaveConfig(); unlink($old) if -e $configfile }
 }
 
 sub SaveConfig {
@@ -1200,6 +1216,8 @@ sub SaveConfig {
     }
     # Save the file if it changed. Chmod the file if it didn't exist before.
     if ( $changed ) {
+	# Create the config directory
+	mkpath(catpath((splitpath($configfile))[0..1]),{mode => 0700});
 	open F, '>', $configfile or warn "Failed to open $configfile: $!\n";
 	eval { chmod 0600, $configfile } if $chmod; # chmod newly created file
 	print F @output;
@@ -1652,7 +1670,7 @@ sub Prefs {
        sub {
 	   my $dirselect = Gtk2::FileChooserDialog->new('Select Music Location',$dialog,'select-folder',('gtk-cancel','reject','gtk-open','accept'));
 	   $dirselect->set_local_only(1);
-	   $dirselect->set_filename($direntry->get_text()||$ENV{HOME}||'');
+	   $dirselect->set_filename($direntry->get_text()||$xdgmusic||'');
 	   my $r = $dirselect->run();
 	   $direntry->set_text($dirselect->get_filename()) if $r eq 'accept';
 	   $dirselect->destroy();
