@@ -853,6 +853,7 @@ sub IconAllocate {
     #print "A $w $h\n";
     #if ( 1 ) {
     my $size = $w > $h ? $w : $h;
+    $size = 64 if $size > 64;
     if ( $h == $oldsize ) { $size = $w }
     if ( $w == $oldsize ) { $size = $h }
     $icon->set_size_request($size,$size) if $size != $oldsize;
@@ -2088,13 +2089,8 @@ sub MC_RepopulateCallback {
 	$tmpbut->signal_connect('clicked', \&MC_Clear);
     }
     if ( $type eq 'sr' or $type eq 'pl' ) {
-	$tmpbut = Gtk2::Button->new();
-	my $tmpbox = Gtk2::HBox->new();
-	$tmpbox->pack_start(Gtk2::Image->new_from_stock('gtk-add','button'),0,0,0);
-	my $tmplabel = Gtk2::Label->new('Add a_ll');
-	$tmplabel->set_use_underline(1);
-	$tmpbox->pack_start($tmplabel,0,0,0);
-	$tmpbut->add($tmpbox);
+	$tmpbut = Gtk2::Button->new_with_mnemonic('Add a_ll');
+	$tmpbut->set_image(Gtk2::Image->new_from_stock('gtk-add','button'));
 	$mcbutbox->pack_start($tmpbut,0,0,0);
 	$tmpbut->signal_connect('clicked',\&MC_AddAll);
     }
