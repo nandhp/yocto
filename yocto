@@ -30,7 +30,7 @@ use IO::Socket::INET;
 use warnings;
 use strict;
 
-my $VERSION = 0.55;
+my $VERSION = 0.56;
 
 # Load "compilation" settings from footer (datadir). Also load text
 # strings from header comments (name, description, copyright, license)
@@ -1145,7 +1145,7 @@ sub LoadConfig {
 	elsif ( $l =~ m/^\s*\[(\w+?)\]\s*$/ ) { $section = $1 }
 	elsif ( !$configfile and $l =~ m/^\s*#\s*(.*?)\s*$/ ) { $comment = $1 }
     }
-    close F;
+    return;
 }
 
 sub MigrateConfig {
@@ -1891,17 +1891,21 @@ sub Prefs {
 	   $prefsdlg = undef;
 	   @prefs_stats = ();
 
-	   $config{External}{RefillCommand} = $refillentry->get_text();
-	   $config{External}{MPDCommand} = $mpdcmdentry->get_text();
 	   my $newhost = $hostentry->get_text();
 	   my $newport = $portentry->get_text();
 	   my $newpass = $passentry->get_text();
-	   my $newdir = $direntry->get_text();#$dirselect->get_filename();
-	   $dialog->destroy;
-	   if ( $newdir ne $config{External}{MusicDirectory} ) {
-	       $config{External}{MusicDirectory} = $newdir;
-	       $savedstate = '';
+	   # Apparently the value of a hidden GtkEntry may disappear.
+	   # Or it's a bug in GTK 2.24.10.
+	   if ( !$connectdlg ) {
+	       $config{External}{RefillCommand} = $refillentry->get_text();
+	       $config{External}{MPDCommand} = $mpdcmdentry->get_text();
+	       my $newdir = $direntry->get_text(); #$dirselect->get_filename();
+	       if ( $newdir ne $config{External}{MusicDirectory} ) {
+	           $config{External}{MusicDirectory} = $newdir;
+	           $savedstate = '';
+	       }
 	   }
+	   $dialog->destroy;
 	   if ( $newhost ne $config{Connection}{MPDHost} or
 		$newport ne $config{Connection}{MPDPort} or
 		$newpass ne $config{Connection}{MPDPass} or
