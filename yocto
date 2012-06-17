@@ -1013,7 +1013,7 @@ sub ToggleRepeat { my ($w) = @_; MPDRepeat($w->get_active()?1:0) }
 sub MediaKey {
     my ($app, $key) = @_;
     return unless $app eq 'Yocto';
-    if ( ($key eq 'Play') )
+    if ( $key eq 'Play' or $key eq 'Pause' )
       { StartTransition(3); $playbutton->clicked() }
     elsif ( $key eq 'Stop' and $playbutton->get_active() )
       { StartTransition(3); $playbutton->clicked() }
