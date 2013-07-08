@@ -1,7 +1,7 @@
 #!/usr/bin/perl
 #
 # Yocto - An MPD client for the system notification area.
-# Copyright (C) 2007-2012 nandhp <nandhp@gmail.com>
+# Copyright (C) 2007-2013 nandhp <nandhp@gmail.com>
 #
 #    This program is free software; you can redistribute it and/or modify
 #    it under the terms of the GNU General Public License as published by
@@ -196,6 +196,9 @@ MenuConnect();				# Connect to MPD
 UpdateTimeout();
 Glib::Timeout->add(1000, sub { UpdateTimeout(); 1 });
 #Glib::Timeout->add(1000*60, sub { Gtk2->main_quit }); # For Profiling
+
+# Update playlists in the background, but somewhat less often
+# Glib::Timeout->add(600*1000, sub { MC_RepopulateSel(); 1 });
 
 # Set up DBus
 my $mediakeys;
