@@ -1,9 +1,12 @@
-CURRENT
+0.56 (07 Jul 2013)
 	- Move configuration to XDG data directory (backwards incompatible:
 	  no symlink is left behind in the old location)
-	- Default Music location to the XDG Music directory
+	- Change default Music location to the XDG Music directory
 	- Use File::Spec for platform-independent filename support
 	- Fix to support Notification Area in Xfce from Ubuntu Lucid
+	- Add support for "single" and "consume"
+	- Add quick playlist switcher (right-click on playlist button) -- BETA
+	- Allow Ctrl+W to close music chooser window
 0.55 (21 Jun 2009)
 	- Use asynchronous communication with MPD
 	- Update icon to make it marginally more visible on dark backgrounds,
