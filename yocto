@@ -158,8 +158,10 @@ my @prefs_stats_l = ();
 my $outputs_populated = 0;
 
 # Music Chooser
-my ($mcwnd, $mcsel, $mcselmodel, $mctree, $mctreemodel, $mcview, $mcsearch,
-    $mcquery, $mcsearchlabel);
+my ($mcwnd, $mcsel, $mctree, $mctreemodel, $mcview, $mcsearch,
+    $mcquery, $mcsearchlabel, $mcaccelgroup);
+my $mcselmodel = Gtk2::ListStore->new('Glib::String',  # Identifier
+                                      'Glib::String'); # Visible markup
 my ($mcbutbox);
 my $mcvisible = 0;
 my ($mctype,$mcarg) = ('','');
@@ -180,7 +182,7 @@ if ( $plugindir and -d $plugindir ) {
     foreach ( readdir(DIR) ) {
 	next if $_ =~ m/^\.|~$/;
 	my $f = "$plugindir/$_";
-	next unless -f $f;
+	next unless -f $f and -s $f;
 	next if $f =~ m/[\$#]$/;
 	do $f or warn "Can't load plugin $f\n  Error(A): $@\n  Error(B): $!\n";
     }
@@ -601,6 +603,7 @@ sub InitWindow {
     $bbox->pack_start($labels[4],0,0,0);
     $button->add($bbox);
     $button->signal_connect('clicked', \&ShowPlaylist);
+    $button->signal_connect('button-release-event', \&PlaylistButtonFunc);
     $tipobj->set_tip($button,'Playlist');
     $butbox->pack_end($button,0,0,0);
 
@@ -1051,6 +1054,37 @@ sub ShowPlaylist {
     $mcwnd->present();
 }
 
+sub PlaylistButtonMenuDetach {
+    ShowTooltip(0);
+}
+
+sub PlaylistButtonFunc {
+    my ($widget, $event) = @_;
+    return 0 unless $event->button == 3;
+    my $menu = Gtk2::Menu->new();
+    AllowTransfers($menu);
+    $menu->attach_to_widget($widget, \&PlaylistButtonMenuDetach);
+
+    my $iter = $mcselmodel->get_iter_first();
+    return 1 unless $iter;
+    do {
+        my ($itemid, $itemname) = $mcselmodel->get($iter,0, 1);
+        (my $itemtype, $itemid) = split ':', $itemid;
+        if ( $itemtype eq 'pl' ) {
+            $itemname =~ s/_/__/g;
+            my $menuitem = Gtk2::MenuItem->new($itemname);
+            $menuitem->signal_connect('activate', sub {
+                MPDClear(); MPDPlLoad($itemid); MPDPlay(0);
+                Update(); MC_Repopulate(); });
+            $menu->add($menuitem);
+        }
+    }
+    while ( $iter = $mcselmodel->iter_next($iter) );
+    $menu->show_all;
+    $menu->popup(undef, undef, undef, undef, $event->button, $event->time);
+    return 1;
+}
+
 sub ShowHelp {
     if ( fork == 0 ) {			# Fork returns undef if it fails
 	my $bin = findINC('xterm') || findINC('gnome-terminal') ||
@@ -1447,6 +1481,7 @@ sub MPDPlClear  { MPDSend('playlistclear',@_);  push @rq, \&MPDResponseSimple }
 sub MPDPlAdd    { MPDSend('playlistadd',@_);    push @rq, \&MPDResponseSimple }
 sub MPDPlRemove { MPDSend('rm',@_);             push @rq, \&MPDResponseSimple }
 sub MPDPlSave   { MPDSend('save',shift @_);push @rq, [\&MPDResponseMCSave,@_] }
+sub MPDPlLoad   { MPDSend('load', @_);          push @rq, \&MPDResponseSimple }
 
 sub MPDOutputs { MPDSend('outputs'); push @rq, [\&MPDResponseOutputs, @_] }
 sub MPDEnableOutput
@@ -1956,9 +1991,6 @@ sub MC_Show {
 	my $vbox = Gtk2::VBox->new();
 	my $topbox = Gtk2::HBox->new();
 
-	$mcselmodel = Gtk2::ListStore->new('Glib::String',  # Identifier
-					   'Glib::String'); # Visible markup
-
 	$mcsel = Gtk2::ComboBox->new($mcselmodel);
 	my $mcselcr = Gtk2::CellRendererText->new();
 	$mcsel->set_size_request(222,-1);
@@ -2015,8 +2047,15 @@ sub MC_Show {
 	$vbox->pack_start($mcbutbox,0,0,0);
 
 	$mcwnd->add($vbox);
-	$mcwnd->signal_connect('delete-event',
-			       sub { $mcwnd->hide; $mcvisible = 0; 1 });
+	$mcwnd->signal_connect('delete-event', \&MC_Hide);
+        # Keyboard accelerators
+        $mcaccelgroup = Gtk2::AccelGroup->new();
+        $mcaccelgroup->connect(Gtk2::Accelerator->parse('<Control>w'), [],
+                               \&MC_Hide);
+        $mcwnd->add_accel_group($mcaccelgroup);
+        # FIXME: Add more accelerators
+        #$mcsave->add_accelerator('activate', $mcaccelgroup,
+        #                         Gtk2::Accelerator->parse('<Control>s'), []);
     }
     $mcvisible = 1;
     MC_RepopulateSel();
@@ -2024,6 +2063,7 @@ sub MC_Show {
     $mcsel->set_active(0);
     $mcwnd->show_all;
 }
+sub MC_Hide { $mcwnd->hide; $mcvisible = 0; 1 }
 sub MC_Repopulate {			# Repopulate the main view
     return $mcscrollnext = 1 unless $mcvisible;
     $mcreorder = 1;
@@ -2151,7 +2191,7 @@ sub MC_RepopulateCallback {
 }
 
 sub MC_RepopulateSel {			# Repopulate the drop down
-    return unless $mcvisible;
+    #return unless $mcvisible;
     return MC_RepopulateSelCallback() unless $sock;
     MPDList('',\&MPDResponseMCList);
 }
@@ -2160,7 +2200,7 @@ sub MC_RepopulateSelCallback {
     $mcselmodel->insert_with_values(-1,0,'np:',1,'Now Playing');
     $mcselmodel->insert_with_values(-1,0,'sr:',1,'Search Results');
     $mcselmodel->insert_with_values(-1,0,':');
-    $mcsel->set_active(0);
+    $mcsel->set_active(0) if $mcvisible;
     return unless $_[0];
     my @pls = ();
     foreach ( sort @{$_[0]} ) {
